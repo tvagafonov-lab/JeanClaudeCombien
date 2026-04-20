@@ -1,10 +1,10 @@
-# Claude Monitor
+# JeanClaudeCombien
 
-Compact always-on-top overlay for Windows that shows your real-time **Claude usage stats** — 5-hour window, weekly limit, Sonnet usage, Claude Design, and extra credits — directly on your desktop.
+Compact always-on-top overlay for Windows that shows your real-time **Claude usage stats** — 5-hour window, weekly limit, Sonnet, Claude Design, and extra credits — directly on your desktop.
 
 No browser tab juggling. No digging through settings.
 
-![Claude Monitor screenshot — full and compact mode](docs/screenshot.png)
+![JeanClaudeCombien — full and compact mode](docs/screenshot.png)
 
 ---
 
@@ -12,15 +12,31 @@ No browser tab juggling. No digging through settings.
 
 | Metric | Description |
 |---|---|
-| ⏱ **5ч окно** | 5-hour rolling window usage |
-| 📅 **Неделя** | 7-day total usage |
-| ✨ **Sonnet** | Claude 3.5 Sonnet usage |
-| 🎨 **Дизайн** | Claude Design (Artifacts) usage |
-| 💳 **Кредиты** | Extra credits used / monthly limit |
+| ⏱ **5h window** | 5-hour rolling window usage |
+| 📅 **Week** | 7-day total usage |
+| ✨ **Sonnet** | Claude Sonnet usage |
+| 🎨 **Design** | Claude Design (Artifacts) usage |
+| 💳 **Credits** | Extra credits used / monthly limit |
 
 Color-coded progress bars: green → yellow → red as limits approach.
 
 **Two modes:** full (with progress bars) and compact (icon + % + time to reset). Double-click the header to switch.
+
+---
+
+## Languages
+
+Right-click the overlay → **🌐 Language** to switch instantly. Setting persists across restarts.
+
+| Code | Language |
+|---|---|
+| `en` | English |
+| `fr` | Français |
+| `es` | Español |
+| `ru` | Русский |
+| `lg` | Luganda |
+
+Want to add your language? Edit [`i18n.py`](i18n.py) — copy any block, add a new key, translate the values. One file, no build step.
 
 ---
 
@@ -37,12 +53,12 @@ Color-coded progress bars: green → yellow → red as limits approach.
 
 ### 1. Download
 
-Click **Code → Download ZIP**, extract anywhere (e.g. `C:\claude_monitor\`).
+Click **Code → Download ZIP**, extract anywhere (e.g. `C:\JeanClaudeCombien\`).
 
 Or clone:
 ```
-git clone https://github.com/YOUR_USERNAME/claude-monitor.git
-cd claude-monitor
+git clone https://github.com/tvagafonov-lab/JeanClaudeCombien.git
+cd JeanClaudeCombien
 ```
 
 ### 2. Run the installer
@@ -83,11 +99,11 @@ To start it manually: double-click **`start_monitor.bat`**
 |---|---|
 | Drag | Move the window anywhere |
 | Double-click header | Toggle compact / full mode |
-| Right-click | Context menu (refresh interval, opacity, refresh now) |
+| Right-click | Context menu (interval, opacity, language, refresh) |
 | ↺ button | Force refresh immediately |
 | ✕ button | Close |
 
-Settings (position, opacity, interval, mode) are saved automatically to `%APPDATA%\Claude\monitor_settings.json`.
+Settings (position, opacity, interval, mode, language) are saved automatically to `%APPDATA%\Claude\monitor_settings.json`.
 
 ---
 
@@ -119,9 +135,10 @@ Sessions expire after a few weeks. When usage data stops updating:
 ## Files
 
 ```
-claude_monitor/
+JeanClaudeCombien/
 ├── claude_monitor.py   # Main overlay (tkinter)
 ├── fetch_usage.py      # Fetches usage from claude.ai API
+├── i18n.py             # All translations — edit here to add a language
 ├── setup.py            # First-time sessionKey setup GUI
 ├── requirements.txt    # Python dependencies
 ├── install.bat         # One-click installer
@@ -132,7 +149,7 @@ User data (not in repo, stored in `%APPDATA%\Claude\`):
 - `monitor_session.json` — your sessionKey
 - `monitor_org.json` — cached org ID
 - `monitor_usage_cache.json` — last fetched usage data
-- `monitor_settings.json` — position, opacity, mode
+- `monitor_settings.json` — position, opacity, mode, language
 
 ---
 
