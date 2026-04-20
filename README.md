@@ -21,9 +21,14 @@ No browser tab juggling. No digging through settings.
 | 🎨 **Design** | Claude Design (Artifacts) usage |
 | 💳 **Credits** | Extra credits used / monthly limit |
 
-Color-coded progress bars: green → yellow → red as limits approach.
+Color-coded progress bars / rings: green → yellow → red as limits approach.
 
-**Two modes:** full (with progress bars) and compact (icon + % + time to reset). Double-click the header to switch.
+**Three modes:**
+- **Full** — progress bars + labels + reset countdowns
+- **Compact** — icon + % + time to reset (165 px wide)
+- **Dock** — donut-ring strip (44 px tall) that snaps above the Windows taskbar
+
+Double-click the header to toggle full ↔ compact. Right-click → ⊞ Dock mode to go minimal.
 
 ---
 
@@ -102,11 +107,11 @@ To start it manually: double-click **`start_monitor.bat`**
 |---|---|
 | Drag | Move the window anywhere |
 | Double-click header | Toggle compact / full mode |
-| Right-click | Context menu (interval, opacity, language, refresh) |
-| ↺ button | Force refresh immediately |
+| Double-click (dock) | Exit dock mode |
+| Right-click | Context menu (mode, %, opacity, language, close) |
 | ✕ button | Close |
 
-Settings (position, opacity, interval, mode, language) are saved automatically to `%APPDATA%\Claude\monitor_settings.json`.
+Settings (position, opacity, mode, language) are saved automatically to `%APPDATA%\Claude\monitor_settings.json`.
 
 ---
 
@@ -131,7 +136,7 @@ Sessions expire after a few weeks. When usage data stops updating:
 
 - Your `orgId` is auto-detected on first run and cached locally.
 
-- Data is refreshed every **5 minutes** by default (configurable: 1 / 5 / 10 / 30 min).
+- Data refreshes automatically: the overlay watches `buddy-tokens.json` for changes (every 5 s) and triggers an API call within 30 s of any Claude Desktop activity.
 
 ---
 
@@ -186,7 +191,7 @@ All data stays on your machine. The only outbound request is to `claude.ai` usin
 Check out the sibling project:
 
 **[CodexHamurabbi](https://github.com/tvagafonov-lab/CodexHamurabbi)** — same idea for Codex Desktop.  
-Shows tokens today, tokens this week, and active sessions. No auth required — reads local SQLite directly.
+Shows 5h window, weekly limit, and extra credits. No auth required — reads directly from Codex's local JSONL session files.
 
 ---
 
