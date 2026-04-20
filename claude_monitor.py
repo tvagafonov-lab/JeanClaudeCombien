@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Claude Token Monitor
-Полный и компактный режим. Двойной клик на заголовке — переключение.
+JeanClaudeCombien — Claude usage overlay for Windows
+Always-on-top widget. Double-click header to toggle compact mode.
+Right-click for settings (interval, opacity, language).
 """
 
 import tkinter as tk
 import json, os, subprocess, sys, threading
 from pathlib import Path
 from datetime import datetime, timezone
+import i18n
 
-# ── Пути ─────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 APPDATA       = Path(os.environ.get("APPDATA", Path.home()))
 CLAUDE_DIR    = APPDATA / "Claude"
 TOKENS_FILE   = CLAUDE_DIR / "buddy-tokens.json"
@@ -21,11 +23,12 @@ DEFAULT_SETTINGS = {
     "opacity":  0.92,
     "interval": 300,
     "compact":  False,
-    "pos_x": -1,
-    "pos_y": -1,
+    "lang":     "en",
+    "pos_x":    -1,
+    "pos_y":    -1,
 }
 
-# ── Цвета ─────────────────────────────────────────────────────────────────────
+# ── Colors ────────────────────────────────────────────────────────────────────
 C = {
     "bg":     "#0d0d1a",
     "bg2":    "#16162a",
@@ -39,20 +42,20 @@ C = {
     "bar":    "#252540",
 }
 
-W_FULL    = 255
+W_FULL    = 265
 W_COMPACT = 165
 
-# Строки: (ключ_pct, ключ_reset, иконка, название)
+# Row definitions: (pct_key, reset_key, icon, i18n_key)
 ROWS = [
-    ("fh_pct", "fh_reset", "⏱", "5ч окно"),
-    ("wd_pct", "wd_reset", "📅", "Неделя"),
-    ("sn_pct", "sn_reset", "✨", "Sonnet"),
-    ("dz_pct", "dz_reset", "🎨", "Дизайн"),
-    ("ex_pct", None,       "💳", "Кредиты"),
+    ("fh_pct", "fh_reset", "⏱", "row_5h"),
+    ("wd_pct", "wd_reset", "📅", "row_week"),
+    ("sn_pct", "sn_reset", "✨", "row_sonnet"),
+    ("dz_pct", "dz_reset", "🎨", "row_design"),
+    ("ex_pct", None,       "💳", "row_credits"),
 ]
 
 
-# ── Утилиты ───────────────────────────────────────────────────────────────────
+# ── Settings ──────────────────────────────────────────────────────────────────
 class Settings:
     def __init__(self):
         self._d = DEFAULT_SETTINGS.copy()
@@ -72,6 +75,7 @@ class Settings:
     def __setitem__(self, k, v): self._d[k] = v; self.save()
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def read_tokens() -> int:
     try:
         d = json.loads(TOKENS_FILE.read_text("utf-8"))
@@ -89,21 +93,21 @@ def read_cache() -> dict:
     return {}
 
 
-def fmt_reset(iso: str | None) -> str:
+def fmt_reset(iso: str | None, lang: str) -> str:
+    tr = i18n.STRINGS.get(lang, i18n.STRINGS["en"])
     if not iso:
         return "—"
     try:
         dt   = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         diff = dt.astimezone(timezone.utc) - datetime.now(tz=timezone.utc)
         if diff.total_seconds() < 0:
-            return "↺ сброс"
+            return tr["reset_done"]
         mins = int(diff.total_seconds() // 60)
         h, m = divmod(mins, 60)
         if diff.total_seconds() < 86400:
-            return f"{h}ч {m:02}м" if h else f"{m}м"
+            return f"{h}h {m:02}m" if h else f"{m}m"
         local = dt.astimezone()
-        days  = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        return f"{days[local.weekday()]} {local.strftime('%H:%M')}"
+        return f"{tr['days'][local.weekday()]} {local.strftime('%H:%M')}"
     except Exception:
         return "—"
 
@@ -120,12 +124,12 @@ def pct_color(pct: float) -> str:
     return C["text"]
 
 
-# ── Основное окно ─────────────────────────────────────────────────────────────
-class ClaudeMonitor:
+# ── Main window ───────────────────────────────────────────────────────────────
+class JeanClaudeCombien:
     def __init__(self):
         self.cfg   = Settings()
         self.root  = tk.Tk()
-        self._body = None          # будет пересоздаваться при смене режима
+        self._body = None
         self._rows_widgets = []
         self._build_window()
         self._build_content()
@@ -133,10 +137,13 @@ class ClaudeMonitor:
         self._refresh_ui()
         self._schedule_bg_fetch()
 
-    # ── Окно (создаётся один раз) ─────────────────────────────────────────────
+    def _t(self, key: str, **kwargs) -> str:
+        return i18n.get(self.cfg["lang"], key, **kwargs)
+
+    # ── Window (built once) ───────────────────────────────────────────────────
     def _build_window(self):
         r = self.root
-        r.title("Claude Monitor")
+        r.title("JeanClaudeCombien")
         r.overrideredirect(True)
         r.attributes("-topmost", True)
         r.attributes("-alpha", self.cfg["opacity"])
@@ -153,13 +160,13 @@ class ClaudeMonitor:
         r.bind("<ButtonRelease-1>", self._drag_end)
         r.bind("<Button-3>",        self._ctx_menu)
 
-        # ── Шапка (один раз) ──────────────────────────────────────────────────
+        # Header (permanent — survives mode/language rebuilds)
         hdr = tk.Frame(r, bg=C["hdr"], height=24)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
-        self._plan_var = tk.StringVar(value="◆ Claude Monitor")
-        hdr_lbl = tk.Label(hdr, textvariable=self._plan_var,
+        self._title_var = tk.StringVar(value="◆ JeanClaudeCombien")
+        hdr_lbl = tk.Label(hdr, textvariable=self._title_var,
                            bg=C["hdr"], fg=C["accent"],
                            font=("Segoe UI", 8, "bold"), cursor="hand2")
         hdr_lbl.pack(side="left", padx=7)
@@ -184,20 +191,24 @@ class ClaudeMonitor:
                  bg=C["hdr"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="right", padx=3)
 
-    # ── Контент (пересоздаётся при смене режима) ──────────────────────────────
+    # ── Content (rebuilt on mode / language change) ───────────────────────────
     def _build_content(self):
         if self._body:
             self._body.destroy()
 
         compact = self.cfg["compact"]
-        W = W_COMPACT if compact else W_FULL
+        lang    = self.cfg["lang"]
+        W       = W_COMPACT if compact else W_FULL
+
+        self._title_var.set("◆ JCC" if compact else "◆ JeanClaudeCombien")
 
         self._body = tk.Frame(self.root, bg=C["bg"],
                               padx=6 if compact else 10)
         self._body.pack(fill="x", pady=(4, 5))
 
         self._rows_widgets = []
-        for key_pct, key_rst, icon, name in ROWS:
+        for key_pct, key_rst, icon, name_key in ROWS:
+            name = i18n.get(lang, name_key)
             if compact:
                 w = self._make_compact_row(self._body, icon)
             else:
@@ -213,35 +224,33 @@ class ClaudeMonitor:
         else:
             self._tok_var = None
 
-        # Resize window width
         x, y = self.root.winfo_x(), self.root.winfo_y()
         self.root.geometry(f"{W}x1+{x}+{y}")
 
     def _make_full_row(self, parent, icon: str, name: str) -> dict:
-        """Полный режим: иконка+название | бар | % | сброс"""
         f = tk.Frame(parent, bg=C["bg"])
         f.pack(fill="x", pady=1)
 
         tk.Label(f, text=f"{icon} {name}", bg=C["bg"], fg=C["muted"],
-                 font=("Segoe UI", 7), width=10, anchor="w").pack(side="left")
+                 font=("Segoe UI", 7), width=12, anchor="w").pack(side="left")
 
         canvas = tk.Canvas(f, height=5, bg=C["bar"],
-                           highlightthickness=0, bd=0, width=72)
+                           highlightthickness=0, bd=0, width=62)
         canvas.pack(side="left", padx=(2, 3))
 
         pct_var = tk.StringVar(value="—")
-        tk.Label(f, textvariable=pct_var, bg=C["bg"], fg=C["text"],
-                 font=("Segoe UI", 7), width=4, anchor="e").pack(side="left")
+        pct_lbl = tk.Label(f, textvariable=pct_var, bg=C["bg"], fg=C["text"],
+                           font=("Segoe UI", 7), width=4, anchor="e")
+        pct_lbl.pack(side="left")
 
         rst_var = tk.StringVar(value="")
         tk.Label(f, textvariable=rst_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="left", padx=(3, 0))
 
         return {"mode": "full", "canvas": canvas,
-                "pct_var": pct_var, "rst_var": rst_var}
+                "pct_var": pct_var, "pct_lbl": pct_lbl, "rst_var": rst_var}
 
     def _make_compact_row(self, parent, icon: str) -> dict:
-        """Компактный режим: иконка  %  сброс"""
         f = tk.Frame(parent, bg=C["bg"])
         f.pack(fill="x", pady=1)
 
@@ -249,18 +258,20 @@ class ClaudeMonitor:
                  font=("Segoe UI", 8), width=2).pack(side="left")
 
         pct_var = tk.StringVar(value="—")
-        tk.Label(f, textvariable=pct_var, bg=C["bg"], fg=C["text"],
-                 font=("Segoe UI", 8, "bold"), width=5, anchor="e").pack(side="left")
+        pct_lbl = tk.Label(f, textvariable=pct_var, bg=C["bg"], fg=C["text"],
+                           font=("Segoe UI", 8, "bold"), width=5, anchor="e")
+        pct_lbl.pack(side="left")
 
         rst_var = tk.StringVar(value="")
         tk.Label(f, textvariable=rst_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="left", padx=(5, 0))
 
-        return {"mode": "compact", "pct_var": pct_var, "rst_var": rst_var}
+        return {"mode": "compact", "pct_var": pct_var, "pct_lbl": pct_lbl,
+                "rst_var": rst_var}
 
     def _draw_bar(self, canvas: tk.Canvas, pct: float, color: str):
         canvas.update_idletasks()
-        w = canvas.winfo_width() or 72
+        w = canvas.winfo_width() or 62
         canvas.delete("all")
         canvas.create_rectangle(0, 0, w, 5, fill=C["bar"], outline="")
         fw = int(w * min(pct, 100) / 100)
@@ -268,67 +279,65 @@ class ClaudeMonitor:
             canvas.create_rectangle(0, 0, fw, 5, fill=color, outline="")
 
     def _fit_height(self):
-        """Подгоняет высоту окна под реальный контент."""
         self.root.update_idletasks()
         h = self.root.winfo_reqheight()
         x, y = self.root.winfo_x(), self.root.winfo_y()
         W = W_COMPACT if self.cfg["compact"] else W_FULL
         self.root.geometry(f"{W}x{h}+{x}+{y}")
 
-    # ── Обновление данных ─────────────────────────────────────────────────────
+    # ── Data refresh ──────────────────────────────────────────────────────────
     def _refresh_ui(self):
         cache  = read_cache()
         tokens = read_tokens()
+        lang   = self.cfg["lang"]
 
-        self._plan_var.set("◆ Claude")
-
-        for i, (key_pct, key_rst, icon, name) in enumerate(ROWS):
+        for i, (key_pct, key_rst, icon, name_key) in enumerate(ROWS):
             pct   = float(cache.get(key_pct, 0))
             color = bar_color(pct)
             w     = self._rows_widgets[i]
 
-            if key_rst is None:  # кредиты (значения уже в евро с центами)
-                used  = cache.get("ex_used",  0)
-                limit = cache.get("ex_limit", 0)
-                curr  = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
+            if key_rst is None:  # Credits row
+                used    = cache.get("ex_used",  0)
+                limit   = cache.get("ex_limit", 0)
+                curr    = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
                 rst_txt = f"{used:.2f} / {limit:.2f} {curr}"
             else:
-                rst_txt = fmt_reset(cache.get(key_rst))
+                rst_txt = fmt_reset(cache.get(key_rst), lang)
 
             w["pct_var"].set(f"{pct:.0f}%")
-            w["pct_var"]  # цвет через configure
+            w["pct_lbl"].config(fg=pct_color(pct))
             w["rst_var"].set(rst_txt)
-
-            # Цвет процента
-            try:
-                w["pct_var"].__label__.config(fg=pct_color(pct))
-            except Exception:
-                pass
 
             if w["mode"] == "full":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
                                 self._draw_bar(c, p, col))
 
         if self._tok_var:
-            self._tok_var.set(f"🔢  {tokens:,} токенов сегодня")
+            self._tok_var.set(self._t("tokens_today", n=f"{tokens:,}"))
 
         if cache.get("fetched_at"):
             try:
-                dt  = datetime.fromisoformat(cache["fetched_at"])
+                dt = datetime.fromisoformat(cache["fetched_at"])
                 self._upd_var.set(f"⟳ {dt.astimezone().strftime('%H:%M')}")
             except Exception:
                 pass
 
         self.root.after(10_000, self._refresh_ui)
 
-    # ── Компактный режим ──────────────────────────────────────────────────────
+    # ── Mode & language ───────────────────────────────────────────────────────
     def _toggle_compact(self):
         self.cfg["compact"] = not self.cfg["compact"]
         self._build_content()
         self.root.after(50, self._fit_height)
         self._refresh_ui()
 
-    # ── Фоновое обновление ────────────────────────────────────────────────────
+    def _set_lang(self, lang: str):
+        self.cfg["lang"] = lang
+        self._build_content()
+        self.root.after(50, self._fit_height)
+        self._refresh_ui()
+
+    # ── Background fetch ──────────────────────────────────────────────────────
     def _bg_fetch(self):
         def run():
             try:
@@ -355,34 +364,47 @@ class ClaudeMonitor:
         self.cfg["pos_x"] = self.root.winfo_x()
         self.cfg["pos_y"] = self.root.winfo_y()
 
-    # ── Контекстное меню ──────────────────────────────────────────────────────
+    # ── Context menu ──────────────────────────────────────────────────────────
     def _ctx_menu(self, e):
+        lang = self.cfg["lang"]
         m = tk.Menu(self.root, tearoff=0, bg=C["bg2"], fg=C["text"],
                     activebackground=C["accent"], font=("Segoe UI", 9), bd=0)
 
-        mode_lbl = "→ Полный режим" if self.cfg["compact"] else "→ Компактный режим"
-        m.add_command(label=mode_lbl, command=self._toggle_compact)
-        m.add_command(label="↺  Обновить сейчас", command=self._bg_fetch)
+        mode_key = "menu_full" if self.cfg["compact"] else "menu_compact"
+        m.add_command(label=self._t(mode_key), command=self._toggle_compact)
+        m.add_command(label=self._t("menu_refresh"), command=self._bg_fetch)
         m.add_separator()
 
+        # Interval submenu
         sub = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
                       activebackground=C["accent"], font=("Segoe UI", 9))
-        for v, lbl in [(60, "1 мин"), (300, "5 мин"), (600, "10 мин"), (1800, "30 мин")]:
+        for v, key in [(60, "int_1m"), (300, "int_5m"),
+                       (600, "int_10m"), (1800, "int_30m")]:
             mark = "✓  " if self.cfg["interval"] == v else "    "
-            sub.add_command(label=f"{mark}{lbl}",
+            sub.add_command(label=f"{mark}{self._t(key)}",
                             command=lambda v=v: self._set_interval(v))
-        m.add_cascade(label="⏰  Интервал", menu=sub)
+        m.add_cascade(label=self._t("menu_interval"), menu=sub)
 
+        # Opacity submenu
         sub2 = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
                        activebackground=C["accent"], font=("Segoe UI", 9))
         for a in (1.0, 0.92, 0.80, 0.60):
             mark = "✓  " if abs(self.cfg["opacity"] - a) < 0.01 else "    "
-            sub2.add_command(label=f"{mark}{int(a*100)}%",
+            sub2.add_command(label=f"{mark}{int(a * 100)}%",
                              command=lambda a=a: self._set_opacity(a))
-        m.add_cascade(label="👁  Прозрачность", menu=sub2)
+        m.add_cascade(label=self._t("menu_opacity"), menu=sub2)
+
+        # Language submenu
+        sub3 = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
+                       activebackground=C["accent"], font=("Segoe UI", 9))
+        for code, label in i18n.LANGUAGES.items():
+            mark = "✓  " if lang == code else "    "
+            sub3.add_command(label=f"{mark}{label}",
+                             command=lambda c=code: self._set_lang(c))
+        m.add_cascade(label=self._t("menu_language"), menu=sub3)
 
         m.add_separator()
-        m.add_command(label="✕  Закрыть", command=self.root.destroy)
+        m.add_command(label=self._t("menu_close"), command=self.root.destroy)
         m.post(e.x_root, e.y_root)
 
     def _set_interval(self, v):
@@ -397,4 +419,4 @@ class ClaudeMonitor:
 
 
 if __name__ == "__main__":
-    ClaudeMonitor().run()
+    JeanClaudeCombien().run()

@@ -31,7 +31,7 @@ sk-ant-sid02-XXXXXXXXXXXXXXXXXXXX...
 
 def run_gui():
     root = tk.Tk()
-    root.title("Claude Monitor — Setup")
+    root.title("JeanClaudeCombien — Setup")
     root.geometry("480x420")
     root.resizable(False, False)
     root.configure(bg="#0d0d1a")
@@ -42,7 +42,7 @@ def run_gui():
     bg        = "#0d0d1a"
     bg2       = "#1e1e36"
 
-    tk.Label(root, text="◆ Claude Monitor Setup",
+    tk.Label(root, text="◆ JeanClaudeCombien — Setup",
              bg=bg, fg=fg_accent,
              font=("Segoe UI", 14, "bold")).pack(pady=(20, 4))
 
