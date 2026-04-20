@@ -6,7 +6,7 @@ Right-click for settings (interval, opacity, language).
 """
 
 import tkinter as tk
-import json, os, subprocess, sys, threading
+import json, os, time, subprocess, sys, threading
 from pathlib import Path
 from datetime import datetime, timezone
 import i18n
@@ -127,10 +127,12 @@ def pct_color(pct: float) -> str:
 # ── Main window ───────────────────────────────────────────────────────────────
 class JeanClaudeCombien:
     def __init__(self):
-        self.cfg   = Settings()
-        self.root  = tk.Tk()
-        self._body = None
-        self._rows_widgets = []
+        self.cfg              = Settings()
+        self.root             = tk.Tk()
+        self._body            = None
+        self._rows_widgets    = []
+        self._known_mtime     = 0.0   # last seen mtime of buddy-tokens.json
+        self._last_fetch_time = 0.0   # timestamp of last API fetch
         self._build_window()
         self._build_content()
         self._fit_height()
@@ -349,8 +351,29 @@ class JeanClaudeCombien:
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
 
+    def _watch_tokens(self):
+        """Every 5 s: re-fetch if buddy-tokens.json changed (30 s cooldown for API)."""
+        try:
+            mt = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
+            now = time.time()
+            if mt > self._known_mtime and now - self._last_fetch_time >= 30:
+                self._known_mtime     = mt
+                self._last_fetch_time = now
+                self._bg_fetch()
+        except Exception:
+            pass
+        self.root.after(5_000, self._watch_tokens)
+
     def _schedule_bg_fetch(self):
+        """Initial fetch on startup + interval fallback + file watcher."""
+        try:
+            self._known_mtime = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
+        except Exception:
+            self._known_mtime = 0.0
+        self._last_fetch_time = time.time()
         self._bg_fetch()
+        self.root.after(5_000, self._watch_tokens)
+        # Fallback: also refresh periodically (session key may expire, browser use, etc.)
         ms = max(self.cfg["interval"] * 1000, 60_000)
         self.root.after(ms, self._schedule_bg_fetch)
 
