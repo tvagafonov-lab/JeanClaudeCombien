@@ -10,7 +10,7 @@ import tkinter as tk
 import ctypes
 import json, os, time, subprocess, sys, threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import i18n
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -55,11 +55,12 @@ DOCK_H    = RING_SIZE + RING_PAD * 2 + 2   # = 44 px (matches Win11 taskbar)
 
 # Row definitions: (pct_key, reset_key, icon, i18n_key)
 ROWS = [
-    ("fh_pct", "fh_reset", "⏱", "row_5h"),
-    ("wd_pct", "wd_reset", "📅", "row_week"),
-    ("sn_pct", "sn_reset", "✨", "row_sonnet"),
-    ("dz_pct", "dz_reset", "🎨", "row_design"),
-    ("ex_pct", None,       "💳", "row_credits"),
+    # (pct_key, reset_key, icon, label_key, window_seconds)
+    ("fh_pct", "fh_reset", "⏱", "row_5h",      5 * 3600),
+    ("wd_pct", "wd_reset", "📅", "row_week",   7 * 86400),
+    ("sn_pct", "sn_reset", "✨", "row_sonnet", 7 * 86400),
+    ("dz_pct", "dz_reset", "🎨", "row_design", 7 * 86400),
+    ("ex_pct", None,       "💳", "row_credits", 0),
 ]
 
 
@@ -109,14 +110,21 @@ def reset_passed(iso: str | None) -> bool:
     return dt is not None and dt < datetime.now(tz=timezone.utc)
 
 
-def fmt_reset(iso: str | None, lang: str) -> str:
+def fmt_reset(iso: str | None, lang: str, window_seconds: int = 0) -> str:
+    """Format an ISO timestamp into a countdown, rolling past resets forward
+    by `window_seconds` so we always show the *next* expected reset."""
     tr = i18n.STRINGS.get(lang, i18n.STRINGS["en"])
     dt = _reset_dt(iso)
     if dt is None:
         return "—"
-    diff = dt - datetime.now(tz=timezone.utc)
+    now  = datetime.now(tz=timezone.utc)
+    diff = dt - now
     if diff.total_seconds() < 0:
-        return tr["reset_done"]
+        if window_seconds <= 0:
+            return tr["reset_done"]
+        cycles = int(-diff.total_seconds() // window_seconds) + 1
+        dt     = dt + timedelta(seconds=window_seconds * cycles)
+        diff   = dt - now
     mins = int(diff.total_seconds() // 60)
     h, m = divmod(mins, 60)
     if diff.total_seconds() < 86400:
@@ -222,7 +230,7 @@ class JeanClaudeCombien:
         self._body.pack(fill="x", pady=(4, 5))
 
         self._rows_widgets = []
-        for key_pct, key_rst, icon, name_key in ROWS:
+        for key_pct, key_rst, icon, name_key, _win_s in ROWS:
             name = i18n.get(lang, name_key)
             if compact:
                 w = self._make_compact_row(self._body, icon)
@@ -298,7 +306,7 @@ class JeanClaudeCombien:
         cache = read_cache()
         lang  = self.cfg["lang"]
 
-        for i, (key_pct, key_rst, icon, name_key) in enumerate(ROWS):
+        for i, (key_pct, key_rst, icon, name_key, win_s) in enumerate(ROWS):
             pct = float(cache.get(key_pct, 0))
             if key_rst is not None and reset_passed(cache.get(key_rst)):
                 pct = 0.0  # stale cache after window rollover
@@ -311,7 +319,7 @@ class JeanClaudeCombien:
                 curr    = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
                 rst_txt = f"{used:.2f} / {limit:.2f} {curr}"
             else:
-                rst_txt = fmt_reset(cache.get(key_rst), lang)
+                rst_txt = fmt_reset(cache.get(key_rst), lang, win_s)
 
             if w["mode"] == "dock":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
@@ -380,7 +388,7 @@ class JeanClaudeCombien:
         self._body = tk.Frame(self.root, bg=C["bg"])
         self._body.pack(fill="both", expand=True)
         self._rows_widgets = []
-        for _key_pct, _key_rst, _icon, _name_key in ROWS:
+        for _key_pct, _key_rst, _icon, _name_key, _win_s in ROWS:
             c = tk.Canvas(self._body, width=RING_SIZE, height=RING_SIZE,
                           bg=C["bg"], highlightthickness=0, bd=0)
             c.pack(side="left", padx=RING_PAD, pady=RING_PAD)
