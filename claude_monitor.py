@@ -53,6 +53,31 @@ RING_SIZE = 36   # ring canvas size (px) in dock mode
 RING_PAD  = 3    # padding around each ring canvas
 DOCK_H    = RING_SIZE + RING_PAD * 2 + 2   # = 44 px (matches Win11 taskbar)
 
+
+# ── Multi-monitor helpers ─────────────────────────────────────────────────────
+def _virtual_screen_rect() -> "tuple[int, int, int, int] | None":
+    """Bounding box of all currently connected monitors, in screen coords."""
+    try:
+        u = ctypes.windll.user32
+        x = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        y = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        w = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        h = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        return (x, y, x + w, y + h)
+    except Exception:
+        return None
+
+
+def _rect_on_screen(x: int, y: int, w: int, h: int, min_overlap: int = 40) -> bool:
+    """True if the window rect overlaps the visible virtual desktop enough to be
+    reachable — used to detect positions stranded on a now-disconnected monitor."""
+    vs = _virtual_screen_rect()
+    if vs is None:
+        return True
+    vl, vt, vr, vb = vs
+    return (min(x + w, vr) - max(x, vl) >= min_overlap
+            and min(y + h, vb) - max(y, vt) >= min_overlap)
+
 # Row definitions: (pct_key, reset_key, icon, i18n_key)
 ROWS = [
     # (pct_key, reset_key, icon, label_key, window_seconds)
@@ -177,6 +202,8 @@ class JeanClaudeCombien:
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         x = self.cfg["pos_x"] if self.cfg["pos_x"] >= 0 else sw - W - 20
         y = self.cfg["pos_y"] if self.cfg["pos_y"] >= 0 else sh - 200 - 60
+        if not _rect_on_screen(x, y, W, 200):
+            x, y = sw - W - 20, sh - 200 - 60  # stranded on a gone monitor
         r.geometry(f"{W}x200+{x}+{y}")
 
         r.bind("<Button-1>",        self._drag_start)
@@ -340,9 +367,29 @@ class JeanClaudeCombien:
             except Exception:
                 pass
 
+        self._reclaim_if_offscreen()
+
         if self._refresh_id is not None:
             self.root.after_cancel(self._refresh_id)
         self._refresh_id = self.root.after(10_000, self._refresh_ui)
+
+    def _reclaim_if_offscreen(self):
+        """If a monitor was disconnected and our window is stranded, snap it back."""
+        try:
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            return
+        if _rect_on_screen(x, y, w, h):
+            return
+        if self.cfg["dock"]:
+            dw = self._dock_width()
+            nx, ny = self._dock_snap_pos(dw, DOCK_H)
+            self.root.geometry(f"{dw}x{DOCK_H}+{nx}+{ny}")
+        else:
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            W = W_COMPACT if self.cfg["compact"] else W_FULL
+            self.root.geometry(f"+{sw - W - 20}+{sh - h - 60}")
 
     # ── Mode & language ───────────────────────────────────────────────────────
     def _rebuild_ui(self):
@@ -372,7 +419,9 @@ class JeanClaudeCombien:
         return len(ROWS) * (RING_SIZE + RING_PAD * 2) + 4
 
     def _dock_snap_pos(self, w: int, h: int) -> tuple:
-        """Y: just above taskbar (via SPI_GETWORKAREA). X: saved or default."""
+        """Y: just above primary-monitor taskbar (SPI_GETWORKAREA).
+        X: saved dock_x, or 80 near Start button. Falls back to the primary
+        monitor if the saved X is stranded on a disconnected monitor."""
         try:
             from ctypes import wintypes
             wa = wintypes.RECT()
@@ -381,6 +430,8 @@ class JeanClaudeCombien:
         except Exception:
             y = self.root.winfo_screenheight() - h - 48  # 48 px fallback
         x = self.cfg["dock_x"] if self.cfg["dock_x"] >= 0 else 80
+        if not _rect_on_screen(x, y, w, h):
+            x = 80
         return x, y
 
     def _build_dock(self):
