@@ -4,7 +4,7 @@ Compact always-on-top overlay for Windows that shows your real-time **Claude usa
 
 No browser tab juggling. No digging through settings.
 
-![JeanClaudeCombien — full and compact mode](docs/screenshot.png)
+<img src="docs/screenshot-full.png" alt="Full mode" width="265"> <img src="docs/screenshot-compact.png" alt="Compact mode" width="165">
 
 ---
 
