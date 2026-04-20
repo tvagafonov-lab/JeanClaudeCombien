@@ -2,7 +2,8 @@
 """
 JeanClaudeCombien — Claude usage overlay for Windows
 Always-on-top widget. Double-click header to toggle compact mode.
-Right-click for settings (interval, opacity, language).
+Right-click for settings (opacity, language, used/remaining toggle).
+Updates automatically when buddy-tokens.json changes (file watcher).
 """
 
 import tkinter as tk
@@ -20,12 +21,12 @@ SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
 FETCH_SCRIPT  = Path(__file__).parent / "fetch_usage.py"
 
 DEFAULT_SETTINGS = {
-    "opacity":  0.92,
-    "interval": 300,
-    "compact":  False,
-    "lang":     "en",
-    "pos_x":    -1,
-    "pos_y":    -1,
+    "opacity":        0.92,
+    "compact":        False,
+    "lang":           "en",
+    "show_remaining": False,   # False = used %, True = remaining %
+    "pos_x":          -1,
+    "pos_y":          -1,
 }
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -76,14 +77,6 @@ class Settings:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def read_tokens() -> int:
-    try:
-        d = json.loads(TOKENS_FILE.read_text("utf-8"))
-        return d.get("tokens-today", {}).get("tokens", 0)
-    except Exception:
-        return 0
-
-
 def read_cache() -> dict:
     try:
         if CACHE_FILE.exists():
@@ -131,8 +124,8 @@ class JeanClaudeCombien:
         self.root             = tk.Tk()
         self._body            = None
         self._rows_widgets    = []
-        self._known_mtime     = 0.0   # last seen mtime of buddy-tokens.json
-        self._last_fetch_time = 0.0   # timestamp of last API fetch
+        self._known_mtime     = 0.0
+        self._last_fetch_time = 0.0
         self._build_window()
         self._build_content()
         self._fit_height()
@@ -181,17 +174,10 @@ class JeanClaudeCombien:
         x_lbl.bind("<Enter>",    lambda _: x_lbl.config(fg=C["red"]))
         x_lbl.bind("<Leave>",    lambda _: x_lbl.config(fg=C["muted"]))
 
-        btn = tk.Label(hdr, text="↺", bg=C["hdr"], fg=C["muted"],
-                       font=("Segoe UI", 11), cursor="hand2")
-        btn.pack(side="right", padx=1)
-        btn.bind("<Button-1>", lambda _: self._bg_fetch())
-        btn.bind("<Enter>",    lambda _: btn.config(fg=C["accent"]))
-        btn.bind("<Leave>",    lambda _: btn.config(fg=C["muted"]))
-
         self._upd_var = tk.StringVar(value="")
         tk.Label(hdr, textvariable=self._upd_var,
                  bg=C["hdr"], fg=C["muted"],
-                 font=("Segoe UI", 7)).pack(side="right", padx=3)
+                 font=("Segoe UI", 7)).pack(side="right", padx=5)
 
     # ── Content (rebuilt on mode / language change) ───────────────────────────
     def _build_content(self):
@@ -216,15 +202,6 @@ class JeanClaudeCombien:
             else:
                 w = self._make_full_row(self._body, icon, name)
             self._rows_widgets.append(w)
-
-        if not compact:
-            tk.Frame(self._body, bg=C["bar"], height=1).pack(fill="x", pady=(4, 2))
-            self._tok_var = tk.StringVar(value="—")
-            tk.Label(self._body, textvariable=self._tok_var,
-                     bg=C["bg"], fg=C["muted"],
-                     font=("Segoe UI", 7)).pack(anchor="w")
-        else:
-            self._tok_var = None
 
         x, y = self.root.winfo_x(), self.root.winfo_y()
         self.root.geometry(f"{W}x1+{x}+{y}")
@@ -289,9 +266,8 @@ class JeanClaudeCombien:
 
     # ── Data refresh ──────────────────────────────────────────────────────────
     def _refresh_ui(self):
-        cache  = read_cache()
-        tokens = read_tokens()
-        lang   = self.cfg["lang"]
+        cache = read_cache()
+        lang  = self.cfg["lang"]
 
         for i, (key_pct, key_rst, icon, name_key) in enumerate(ROWS):
             pct   = float(cache.get(key_pct, 0))
@@ -306,16 +282,14 @@ class JeanClaudeCombien:
             else:
                 rst_txt = fmt_reset(cache.get(key_rst), lang)
 
-            w["pct_var"].set(f"{pct:.0f}%")
+            display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
+            w["pct_var"].set(f"{display_pct:.0f}%")
             w["pct_lbl"].config(fg=pct_color(pct))
             w["rst_var"].set(rst_txt)
 
             if w["mode"] == "full":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
                                 self._draw_bar(c, p, col))
-
-        if self._tok_var:
-            self._tok_var.set(self._t("tokens_today", n=f"{tokens:,}"))
 
         if cache.get("fetched_at"):
             try:
@@ -339,6 +313,10 @@ class JeanClaudeCombien:
         self.root.after(50, self._fit_height)
         self._refresh_ui()
 
+    def _toggle_show_remaining(self):
+        self.cfg["show_remaining"] = not self.cfg["show_remaining"]
+        self._refresh_ui()
+
     # ── Background fetch ──────────────────────────────────────────────────────
     def _bg_fetch(self):
         def run():
@@ -352,9 +330,9 @@ class JeanClaudeCombien:
         self._upd_var.set("↻ …")
 
     def _watch_tokens(self):
-        """Every 5 s: re-fetch if buddy-tokens.json changed (30 s cooldown for API)."""
+        """Every 5 s: re-fetch if buddy-tokens.json changed (30 s API cooldown)."""
         try:
-            mt = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
+            mt  = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
             now = time.time()
             if mt > self._known_mtime and now - self._last_fetch_time >= 30:
                 self._known_mtime     = mt
@@ -365,7 +343,7 @@ class JeanClaudeCombien:
         self.root.after(5_000, self._watch_tokens)
 
     def _schedule_bg_fetch(self):
-        """Initial fetch on startup + interval fallback + file watcher."""
+        """Initial fetch on startup + periodic fallback + file watcher."""
         try:
             self._known_mtime = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
         except Exception:
@@ -373,9 +351,8 @@ class JeanClaudeCombien:
         self._last_fetch_time = time.time()
         self._bg_fetch()
         self.root.after(5_000, self._watch_tokens)
-        # Fallback: also refresh periodically (session key may expire, browser use, etc.)
-        ms = max(self.cfg["interval"] * 1000, 60_000)
-        self.root.after(ms, self._schedule_bg_fetch)
+        # Fallback: re-fetch every 5 min regardless (browser use, session refresh)
+        self.root.after(300_000, self._schedule_bg_fetch)
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e): self._ox, self._oy = e.x, e.y
@@ -395,18 +372,10 @@ class JeanClaudeCombien:
 
         mode_key = "menu_full" if self.cfg["compact"] else "menu_compact"
         m.add_command(label=self._t(mode_key), command=self._toggle_compact)
-        m.add_command(label=self._t("menu_refresh"), command=self._bg_fetch)
-        m.add_separator()
 
-        # Interval submenu
-        sub = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
-                      activebackground=C["accent"], font=("Segoe UI", 9))
-        for v, key in [(60, "int_1m"), (300, "int_5m"),
-                       (600, "int_10m"), (1800, "int_30m")]:
-            mark = "✓  " if self.cfg["interval"] == v else "    "
-            sub.add_command(label=f"{mark}{self._t(key)}",
-                            command=lambda v=v: self._set_interval(v))
-        m.add_cascade(label=self._t("menu_interval"), menu=sub)
+        pct_key = "menu_show_used" if self.cfg["show_remaining"] else "menu_show_remaining"
+        m.add_command(label=self._t(pct_key), command=self._toggle_show_remaining)
+        m.add_separator()
 
         # Opacity submenu
         sub2 = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
@@ -429,9 +398,6 @@ class JeanClaudeCombien:
         m.add_separator()
         m.add_command(label=self._t("menu_close"), command=self.root.destroy)
         m.post(e.x_root, e.y_root)
-
-    def _set_interval(self, v):
-        self.cfg["interval"] = v
 
     def _set_opacity(self, v):
         self.cfg["opacity"] = v
