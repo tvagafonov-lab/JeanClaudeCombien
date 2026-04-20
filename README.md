@@ -7,7 +7,7 @@ Compact always-on-top overlay that shows your real-time **Claude usage stats** â
 
 No browser tab juggling. No digging through settings.
 
-<img src="docs/screenshot-full.png" alt="Full mode" width="265"> <img src="docs/screenshot-compact.png" alt="Compact mode" width="165">
+<img src="docs/screenshot-full.png" alt="Full mode" width="265"> <img src="docs/screenshot-compact.png" alt="Compact mode" width="165"> <img src="docs/screenshot-dock.png" alt="Dock mode" width="218">
 
 ---
 
