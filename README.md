@@ -1,6 +1,9 @@
 # JeanClaudeCombien
 
-Compact always-on-top overlay for Windows that shows your real-time **Claude usage stats** — 5-hour window, weekly limit, Sonnet, Claude Design, and extra credits — directly on your desktop.
+> **The only usage monitor built specifically for the Claude Desktop app (Windows).**  
+> Other tools require a browser session or CLI credentials — this one reads directly from the Desktop app, no browser needed.
+
+Compact always-on-top overlay that shows your real-time **Claude usage stats** — 5-hour window, weekly limit, Sonnet, Claude Design, and extra credits — directly on your desktop.
 
 No browser tab juggling. No digging through settings.
 
@@ -175,6 +178,15 @@ User data (not in repo, stored in `%APPDATA%\Claude\`):
 ## Privacy
 
 All data stays on your machine. The only outbound request is to `claude.ai` using your own session cookie — the same request your browser makes when you visit the usage page. No telemetry, no third-party servers.
+
+---
+
+## Support the project
+
+If JeanClaudeCombien saves you time, consider buying me a coffee ☕
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/YOUR_NAME)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/YOUR_NAME)
 
 ---
 
