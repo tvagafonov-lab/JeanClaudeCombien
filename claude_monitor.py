@@ -126,6 +126,7 @@ class JeanClaudeCombien:
         self._rows_widgets    = []
         self._known_mtime     = 0.0
         self._last_fetch_time = 0.0
+        self._refresh_id      = None
         self._build_window()
         self._build_content()
         self._fit_height()
@@ -298,20 +299,23 @@ class JeanClaudeCombien:
             except Exception:
                 pass
 
-        self.root.after(10_000, self._refresh_ui)
+        if self._refresh_id is not None:
+            self.root.after_cancel(self._refresh_id)
+        self._refresh_id = self.root.after(10_000, self._refresh_ui)
 
     # ── Mode & language ───────────────────────────────────────────────────────
-    def _toggle_compact(self):
-        self.cfg["compact"] = not self.cfg["compact"]
+    def _rebuild_ui(self):
         self._build_content()
         self.root.after(50, self._fit_height)
         self._refresh_ui()
+
+    def _toggle_compact(self):
+        self.cfg["compact"] = not self.cfg["compact"]
+        self._rebuild_ui()
 
     def _set_lang(self, lang: str):
         self.cfg["lang"] = lang
-        self._build_content()
-        self.root.after(50, self._fit_height)
-        self._refresh_ui()
+        self._rebuild_ui()
 
     def _toggle_show_remaining(self):
         self.cfg["show_remaining"] = not self.cfg["show_remaining"]
