@@ -181,6 +181,15 @@ All data stays on your machine. The only outbound request is to `claude.ai` usin
 
 ---
 
+## Also using Codex Desktop?
+
+Check out the sibling project:
+
+**[CodexHamurabbi](https://github.com/tvagafonov-lab/CodexHamurabbi)** — same idea for Codex Desktop.  
+Shows tokens today, tokens this week, and active sessions. No auth required — reads local SQLite directly.
+
+---
+
 ## Support the project
 
 If JeanClaudeCombien saves you time, consider buying me a coffee ☕
