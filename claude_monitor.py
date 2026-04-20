@@ -7,6 +7,7 @@ Updates automatically when buddy-tokens.json changes (file watcher).
 """
 
 import tkinter as tk
+import ctypes
 import json, os, time, subprocess, sys, threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ FETCH_SCRIPT  = Path(__file__).parent / "fetch_usage.py"
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
     "compact":        False,
+    "dock":           False,
+    "dock_x":         -1,      # saved X in dock mode (-1 = default near Start)
     "lang":           "en",
     "show_remaining": False,   # False = used %, True = remaining %
     "pos_x":          -1,
@@ -45,6 +48,10 @@ C = {
 
 W_FULL    = 265
 W_COMPACT = 165
+
+RING_SIZE = 36   # ring canvas size (px) in dock mode
+RING_PAD  = 3    # padding around each ring canvas
+DOCK_H    = RING_SIZE + RING_PAD * 2 + 2   # = 44 px (matches Win11 taskbar)
 
 # Row definitions: (pct_key, reset_key, icon, i18n_key)
 ROWS = [
@@ -155,20 +162,20 @@ class JeanClaudeCombien:
         r.bind("<B1-Motion>",       self._drag_move)
         r.bind("<ButtonRelease-1>", self._drag_end)
         r.bind("<Button-3>",        self._ctx_menu)
+        r.bind("<Double-Button-1>", self._on_double_click)
 
-        # Header (permanent — survives mode/language rebuilds)
-        hdr = tk.Frame(r, bg=C["hdr"], height=24)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
+        # Header — hidden in dock mode; packed/unpacked by _build_content
+        self._hdr = tk.Frame(r, bg=C["hdr"], height=24)
+        self._hdr.pack_propagate(False)
 
         self._title_var = tk.StringVar(value="◆ JeanClaudeCombien")
-        hdr_lbl = tk.Label(hdr, textvariable=self._title_var,
+        hdr_lbl = tk.Label(self._hdr, textvariable=self._title_var,
                            bg=C["hdr"], fg=C["accent"],
                            font=("Segoe UI", 8, "bold"), cursor="hand2")
         hdr_lbl.pack(side="left", padx=7)
         hdr_lbl.bind("<Double-Button-1>", lambda _: self._toggle_compact())
 
-        x_lbl = tk.Label(hdr, text="✕", bg=C["hdr"], fg=C["muted"],
+        x_lbl = tk.Label(self._hdr, text="✕", bg=C["hdr"], fg=C["muted"],
                          font=("Segoe UI", 10), cursor="hand2")
         x_lbl.pack(side="right", padx=5)
         x_lbl.bind("<Button-1>", lambda _: r.destroy())
@@ -176,15 +183,21 @@ class JeanClaudeCombien:
         x_lbl.bind("<Leave>",    lambda _: x_lbl.config(fg=C["muted"]))
 
         self._upd_var = tk.StringVar(value="")
-        tk.Label(hdr, textvariable=self._upd_var,
+        tk.Label(self._hdr, textvariable=self._upd_var,
                  bg=C["hdr"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="right", padx=5)
 
     # ── Content (rebuilt on mode / language change) ───────────────────────────
     def _build_content(self):
+        self._hdr.pack_forget()
         if self._body:
             self._body.destroy()
 
+        if self.cfg["dock"]:
+            self._build_dock()
+            return
+
+        self._hdr.pack(fill="x")
         compact = self.cfg["compact"]
         lang    = self.cfg["lang"]
         W       = W_COMPACT if compact else W_FULL
@@ -259,6 +272,8 @@ class JeanClaudeCombien:
             canvas.create_rectangle(0, 0, fw, 5, fill=color, outline="")
 
     def _fit_height(self):
+        if self.cfg["dock"]:
+            return  # geometry fixed by _build_dock
         self.root.update_idletasks()
         h = self.root.winfo_reqheight()
         x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -283,14 +298,17 @@ class JeanClaudeCombien:
             else:
                 rst_txt = fmt_reset(cache.get(key_rst), lang)
 
-            display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
-            w["pct_var"].set(f"{display_pct:.0f}%")
-            w["pct_lbl"].config(fg=pct_color(pct))
-            w["rst_var"].set(rst_txt)
-
-            if w["mode"] == "full":
+            if w["mode"] == "dock":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
-                                self._draw_bar(c, p, col))
+                                self._draw_ring(c, p, col))
+            else:
+                display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
+                w["pct_var"].set(f"{display_pct:.0f}%")
+                w["pct_lbl"].config(fg=pct_color(pct))
+                w["rst_var"].set(rst_txt)
+                if w["mode"] == "full":
+                    self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
+                                    self._draw_bar(c, p, col))
 
         if cache.get("fetched_at"):
             try:
@@ -316,6 +334,66 @@ class JeanClaudeCombien:
     def _set_lang(self, lang: str):
         self.cfg["lang"] = lang
         self._rebuild_ui()
+
+    def _on_double_click(self, e):
+        if self.cfg["dock"]:
+            self._toggle_dock()
+        # non-dock: header label handles its own double-click → toggle compact
+
+    def _toggle_dock(self):
+        self.cfg["dock"] = not self.cfg["dock"]
+        self._rebuild_ui()
+
+    # ── Dock mode helpers ─────────────────────────────────────────────────────
+    def _dock_width(self) -> int:
+        return len(ROWS) * (RING_SIZE + RING_PAD * 2) + 4
+
+    def _dock_snap_pos(self, w: int, h: int) -> tuple:
+        """Y: just above taskbar (via SPI_GETWORKAREA). X: saved or default."""
+        try:
+            from ctypes import wintypes
+            wa = wintypes.RECT()
+            ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(wa), 0)
+            y = wa.bottom - h
+        except Exception:
+            y = self.root.winfo_screenheight() - h - 48  # 48 px fallback
+        x = self.cfg["dock_x"] if self.cfg["dock_x"] >= 0 else 80
+        return x, y
+
+    def _build_dock(self):
+        """Build the dock strip: one ring canvas per row, no header."""
+        self._body = tk.Frame(self.root, bg=C["bg"])
+        self._body.pack(fill="both", expand=True)
+        self._rows_widgets = []
+        for _key_pct, _key_rst, _icon, _name_key in ROWS:
+            c = tk.Canvas(self._body, width=RING_SIZE, height=RING_SIZE,
+                          bg=C["bg"], highlightthickness=0, bd=0)
+            c.pack(side="left", padx=RING_PAD, pady=RING_PAD)
+            self._rows_widgets.append({"mode": "dock", "canvas": c})
+        dw = self._dock_width()
+        dx, dy = self._dock_snap_pos(dw, DOCK_H)
+        self.root.geometry(f"{dw}x{DOCK_H}+{dx}+{dy}")
+
+    def _draw_ring(self, canvas: tk.Canvas, pct: float, color: str):
+        """Draw a donut-ring progress indicator on canvas."""
+        canvas.delete("all")
+        s, p = RING_SIZE, 3
+        display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
+        # Background ring (full circle)
+        canvas.create_arc(p, p, s - p, s - p,
+                          start=90, extent=-359.9,
+                          style="arc", width=4, outline=C["bar"])
+        # Progress arc
+        if display_pct > 0:
+            canvas.create_arc(p, p, s - p, s - p,
+                              start=90,
+                              extent=-max(1.0, 3.6 * min(display_pct, 100)),
+                              style="arc", width=4, outline=color)
+        # Center percentage text
+        canvas.create_text(s // 2, s // 2,
+                           text=f"{display_pct:.0f}",
+                           fill=color if pct >= 1 else C["muted"],
+                           font=("Segoe UI", 7, "bold"))
 
     def _toggle_show_remaining(self):
         self.cfg["show_remaining"] = not self.cfg["show_remaining"]
@@ -365,8 +443,11 @@ class JeanClaudeCombien:
         y = self.root.winfo_y() + e.y - self._oy
         self.root.geometry(f"+{x}+{y}")
     def _drag_end(self, e):
-        self.cfg["pos_x"] = self.root.winfo_x()
-        self.cfg["pos_y"] = self.root.winfo_y()
+        if self.cfg["dock"]:
+            self.cfg["dock_x"] = self.root.winfo_x()
+        else:
+            self.cfg["pos_x"] = self.root.winfo_x()
+            self.cfg["pos_y"] = self.root.winfo_y()
 
     # ── Context menu ──────────────────────────────────────────────────────────
     def _ctx_menu(self, e):
@@ -374,8 +455,12 @@ class JeanClaudeCombien:
         m = tk.Menu(self.root, tearoff=0, bg=C["bg2"], fg=C["text"],
                     activebackground=C["accent"], font=("Segoe UI", 9), bd=0)
 
-        mode_key = "menu_full" if self.cfg["compact"] else "menu_compact"
-        m.add_command(label=self._t(mode_key), command=self._toggle_compact)
+        if self.cfg["dock"]:
+            m.add_command(label=self._t("menu_exit_dock"), command=self._toggle_dock)
+        else:
+            mode_key = "menu_full" if self.cfg["compact"] else "menu_compact"
+            m.add_command(label=self._t(mode_key), command=self._toggle_compact)
+            m.add_command(label=self._t("menu_dock"), command=self._toggle_dock)
 
         pct_key = "menu_show_used" if self.cfg["show_remaining"] else "menu_show_remaining"
         m.add_command(label=self._t(pct_key), command=self._toggle_show_remaining)
