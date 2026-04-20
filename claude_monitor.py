@@ -32,18 +32,18 @@ DEFAULT_SETTINGS = {
     "pos_y":          -1,
 }
 
-# ── Colors ────────────────────────────────────────────────────────────────────
+# ── Colors — Claude orange on warm dark ───────────────────────────────────────
 C = {
-    "bg":     "#0d0d1a",
-    "bg2":    "#16162a",
-    "hdr":    "#1e1e36",
-    "accent": "#7b61ff",
-    "text":   "#e2e2e2",
-    "muted":  "#5a5a7a",
-    "green":  "#4ade80",
-    "yellow": "#fbbf24",
-    "red":    "#f87171",
-    "bar":    "#252540",
+    "bg":     "#110a06",
+    "bg2":    "#1f140a",
+    "hdr":    "#2a1a0e",
+    "accent": "#d97757",   # Claude orange
+    "text":   "#f5e5d3",   # warm cream
+    "muted":  "#7a5c45",
+    "green":  "#7ecf6e",
+    "yellow": "#e8a020",
+    "red":    "#e06050",
+    "bar":    "#3a2515",
 }
 
 W_FULL    = 265
@@ -93,29 +93,36 @@ def read_cache() -> dict:
     return {}
 
 
+def _reset_dt(iso: str | None) -> "datetime | None":
+    """Parse an ISO timestamp into an aware UTC datetime, or None if invalid."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def reset_passed(iso: str | None) -> bool:
+    """True if the given ISO timestamp is in the past."""
+    dt = _reset_dt(iso)
+    return dt is not None and dt < datetime.now(tz=timezone.utc)
+
+
 def fmt_reset(iso: str | None, lang: str) -> str:
     tr = i18n.STRINGS.get(lang, i18n.STRINGS["en"])
-    if not iso:
+    dt = _reset_dt(iso)
+    if dt is None:
         return "—"
-    try:
-        dt   = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        diff = dt.astimezone(timezone.utc) - datetime.now(tz=timezone.utc)
-        if diff.total_seconds() < 0:
-            ago = int(-diff.total_seconds() // 60)
-            if ago < 2:
-                return tr["reset_done"]
-            if ago < 60:
-                return f"↺ -{ago}m"
-            ah, am = divmod(ago, 60)
-            return f"↺ -{ah}h {am:02}m" if am else f"↺ -{ah}h"
-        mins = int(diff.total_seconds() // 60)
-        h, m = divmod(mins, 60)
-        if diff.total_seconds() < 86400:
-            return f"{h}h {m:02}m" if h else f"{m}m"
-        local = dt.astimezone()
-        return f"{tr['days'][local.weekday()]} {local.strftime('%H:%M')}"
-    except Exception:
-        return "—"
+    diff = dt - datetime.now(tz=timezone.utc)
+    if diff.total_seconds() < 0:
+        return tr["reset_done"]
+    mins = int(diff.total_seconds() // 60)
+    h, m = divmod(mins, 60)
+    if diff.total_seconds() < 86400:
+        return f"{h}h {m:02}m" if h else f"{m}m"
+    local = dt.astimezone()
+    return f"{tr['days'][local.weekday()]} {local.strftime('%H:%M')}"
 
 
 def bar_color(pct: float) -> str:
@@ -208,7 +215,7 @@ class JeanClaudeCombien:
         lang    = self.cfg["lang"]
         W       = W_COMPACT if compact else W_FULL
 
-        self._title_var.set("◆ JCC" if compact else "◆ JeanClaudeCombien")
+        self._title_var.set("◆ Claude" if compact else "◆ JeanClaudeCombien")
 
         self._body = tk.Frame(self.root, bg=C["bg"],
                               padx=6 if compact else 10)
@@ -292,7 +299,9 @@ class JeanClaudeCombien:
         lang  = self.cfg["lang"]
 
         for i, (key_pct, key_rst, icon, name_key) in enumerate(ROWS):
-            pct   = float(cache.get(key_pct, 0))
+            pct = float(cache.get(key_pct, 0))
+            if key_rst is not None and reset_passed(cache.get(key_rst)):
+                pct = 0.0  # stale cache after window rollover
             color = bar_color(pct)
             w     = self._rows_widgets[i]
 
