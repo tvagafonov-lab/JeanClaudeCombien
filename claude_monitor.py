@@ -125,12 +125,12 @@ TRAY_EDGE_MARGIN    = 1    # inset from icon edge
 # Stable uID + GUID let Windows 11 NotifyIconSettings register this app
 # independently of other pythonw.exe tray icons. The GUID is the field Win11
 # actually keys on; the uID is kept as a legacy fallback.
-TRAY_UID  = 0x7C1A_DE77
-# Fresh GUID (changed 2026-04-21) — Windows remembers GUID→exe bindings; if
-# a previous GUID got "stuck" on Win11 NotifyIconSettings, bumping it past
-# that snapshot makes Windows register the icon as new.
-TRAY_GUID = (0x2026A011, 0xC1A0, 0xDE77,
-             (0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x77, 0x77))
+TRAY_UID  = 0xC1A0_DE77
+# Stable GUID. Do NOT change this once users have it registered — Windows 11
+# binds (GUID→exe) at first NIM_ADD and refuses fresh GUID registrations
+# from the same exe for a while after.
+TRAY_GUID = (0xC1A0DE77, 0xCAD5, 0xEAF1,
+             (0x77, 0x77, 0xC1, 0xA0, 0xDE, 0x77, 0xC1, 0xA0))
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -329,23 +329,37 @@ def _render_single_ring(size: int, pct: float, color_rgba: tuple,
                         track_rgba: tuple, stroke: int,
                         supersample: int = 4,
                         center_rgba: "tuple | None" = None,
-                        edge_margin: int = 3):
+                        edge_margin: int = 3,
+                        outline_rgba: "tuple | None" = None,
+                        outline_width: int = 1):
     """Render an antialiased progress ring of `size`×`size` via supersampling.
+
     Pillow's `arc` has no built-in AA — drawing at 4× size and LANCZOS-
     downsampling gives clean curves at the target resolution.
 
     If `center_rgba` is given, also fills a brand-colored disc inside the
-    ring (for tray icons); the disc is flush against the ring's inside edge."""
-    S = size * supersample
+    ring. If `outline_rgba` is given too, a thin contour is drawn along
+    both edges of the ring and around the center disc — lifts the icon
+    off dark/light taskbars at 16 px."""
+    S   = size * supersample
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d   = ImageDraw.Draw(img)
     sw  = stroke * supersample
     margin = edge_margin * supersample
+    ow  = outline_width * supersample
+
     bbox = (margin, margin, S - margin - 1, S - margin - 1)
     d.ellipse(bbox, outline=track_rgba, width=sw)
     if pct > 0:
         span = max(1.0, min(359.9, 3.6 * pct))
         d.arc(bbox, start=-90, end=-90 + span, fill=color_rgba, width=sw)
+
+    if outline_rgba is not None and ow > 0:
+        d.ellipse(bbox, outline=outline_rgba, width=ow)
+        ie = margin + sw - ow
+        d.ellipse((ie, ie, S - ie - 1, S - ie - 1),
+                  outline=outline_rgba, width=ow)
+
     if center_rgba is not None:
         c = margin + sw
         d.ellipse((c, c, S - c - 1, S - c - 1), fill=center_rgba)
@@ -873,8 +887,10 @@ class JeanClaudeCombien:
             ring_color(pct_5h),
             (110, 70, 40, 90),         # semi-transparent warm track
             TRAY_RING_STROKE,
-            center_rgba=(255, 140, 64, 255),   # Claude vivid orange
+            center_rgba=(255, 230, 200, 255),   # near-white with Claude tint
             edge_margin=TRAY_EDGE_MARGIN,
+            outline_rgba=(60, 30, 10, 220),     # dark warm-brown contour
+            outline_width=1,
         )
 
     def _build_tray_tooltip(self, cache: "dict | None" = None,
