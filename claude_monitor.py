@@ -112,7 +112,7 @@ DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # close to Win11 taskbar (4
 DOCK_RING_STROKE    = 7    # ring thickness in dock mode
 DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
 TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
-REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
+REFETCH_INTERVAL_MS = 180_000   # 3 min fallback re-fetch (same as CHB)
 # Tray icons are drawn at 64×64 then Windows scales them to the active tray
 # size (16 / 20 / 24 px depending on DPI). Pillow supersamples 4× internally
 # and LANCZOS-downsamples to 64 for antialiased ring edges.
@@ -758,11 +758,20 @@ class JeanClaudeCombien:
                 fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
+                # Reset the cached cloudscraper session — a TLS / network /
+                # Cloudflare hiccup leaves the Scraper object in a state
+                # where every subsequent call raises the same error. Next
+                # _bg_fetch will rebuild a fresh session.
+                try:
+                    fetch_usage._scraper = None
+                    fetch_usage._scraper_key = None
+                except Exception:
+                    pass
             if err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after Windows sign-in / unlock the network stack may
                 # not be fully up yet — retry with short backoff so we don't
-                # end up stuck on a cold cache until the 5 min fallback.
+                # end up stuck on a cold cache until the 3-min fallback.
                 retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
                 if retry_ms <= 60_000:
                     self.root.after(retry_ms, self._bg_fetch)
@@ -803,9 +812,14 @@ class JeanClaudeCombien:
         except Exception:
             self._known_mtime = 0.0
         self._last_fetch_time = time.time()
-        self._bg_fetch()
+        # Small delay on the *first* fetch after startup so the Windows
+        # network stack has time to come up (sign-in / unlock otherwise
+        # often times out the first cloudscraper call).
+        delay = 3_000 if getattr(self, "_first_fetch_done", False) is False else 0
+        self._first_fetch_done = True
+        self.root.after(delay, self._bg_fetch)
         self.root.after(5_000, self._watch_tokens)
-        # Fallback: re-fetch every 5 min regardless (browser use, session refresh)
+        # Fallback: re-fetch every 3 min regardless (browser use, session refresh)
         self.root.after(REFETCH_INTERVAL_MS, self._schedule_bg_fetch)
 
     # ── Tray mode ─────────────────────────────────────────────────────────────
