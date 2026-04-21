@@ -20,8 +20,24 @@ import fetch_usage
 # has no AA, so we supersample through Pillow and display via ImageTk.
 try:
     import pystray
+    import pystray._win32 as _pystray_win32
+    from pystray._win32 import win32 as _pystray_w32
     from PIL import Image, ImageDraw, ImageTk
     TRAY_AVAILABLE = True
+
+    # Pystray uses `hID = id(self)` which collides across processes sharing
+    # the same pythonw.exe, so Windows 11 NotifyIconSettings deduplicates us
+    # down to a single registry entry. Override with `self._uid` so each app
+    # gets its own entry and can be individually enabled in Taskbar settings.
+    def _pystray_message_patched(self, code, flags, **kwargs):
+        import ctypes
+        _pystray_w32.Shell_NotifyIcon(code, _pystray_w32.NOTIFYICONDATAW(
+            cbSize=ctypes.sizeof(_pystray_w32.NOTIFYICONDATAW),
+            hWnd=self._hwnd,
+            hID=getattr(self, "_uid", None) or id(self),
+            uFlags=flags,
+            **kwargs))
+    _pystray_win32.Icon._message = _pystray_message_patched
 except Exception:
     TRAY_AVAILABLE = False
 
@@ -72,7 +88,7 @@ W_COMPACT = 165
 RING_SIZE           = 40   # ring canvas size (px) in dock mode
 RING_PAD            = 2    # padding around each ring canvas
 DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # close to Win11 taskbar (44 px)
-DOCK_RING_STROKE    = 6    # ring thickness in dock mode
+DOCK_RING_STROKE    = 7    # ring thickness in dock mode
 DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
 TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
 REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
@@ -80,10 +96,13 @@ REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates
 # size (16 / 20 / 24 px depending on DPI). Pillow supersamples 4× internally
 # and LANCZOS-downsamples to 64 for antialiased ring edges.
 TRAY_ICON_SIZE      = 64
-TRAY_OUTER_STROKE   = 10   # outer ring (5h) thickness at target size
-TRAY_INNER_STROKE   = 8    # inner ring (week) thickness at target size
+TRAY_OUTER_STROKE   = 12   # outer ring (5h) thickness at target size
+TRAY_INNER_STROKE   = 10   # inner ring (week) thickness at target size
 TRAY_RING_GAP       = 1    # gap between outer and inner rings
-TRAY_EDGE_MARGIN    = 1    # inset from icon edge to outermost ring
+TRAY_EDGE_MARGIN    = 0    # inset from icon edge to outermost ring (flush)
+# Stable uID lets Windows 11 NotifyIconSettings register this app
+# independently of other pythonw.exe tray icons.
+TRAY_UID = 0xC1A0_DE77
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -229,6 +248,53 @@ def _pil_color(hex_str: str) -> tuple:
     """Convert a '#rrggbb' string to an opaque RGBA tuple for Pillow."""
     h = hex_str.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+
+def _promote_tray_icon(uid: int, name_hint: str) -> None:
+    """Win11 hides new tray icons in the overflow flyout by default. The
+    visibility is tracked in HKCU\\Control Panel\\NotifyIconSettings\\<id>
+    with an `IsPromoted` DWORD. Setting it to 1 shows the icon next to the
+    clock. Silent no-op if the key / app doesn't exist yet or on older
+    Windows versions."""
+    try:
+        import winreg, sys
+        exe_cmp = sys.executable.lower()
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                              r"Control Panel\NotifyIconSettings",
+                              0, winreg.KEY_READ)
+        target = None
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i); i += 1
+            except OSError:
+                break
+            sk = winreg.OpenKey(root, sub)
+            vals = {}
+            j = 0
+            while True:
+                try:
+                    k, v, _ = winreg.EnumValue(sk, j); j += 1
+                    vals[k] = v
+                except OSError:
+                    break
+            winreg.CloseKey(sk)
+            exe = vals.get("ExecutablePath", "").lower()
+            if exe != exe_cmp:
+                continue
+            if vals.get("UID") == uid or name_hint in vals.get("InitialTooltip", ""):
+                target = sub
+                break
+        winreg.CloseKey(root)
+        if not target:
+            return
+        sk = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Control Panel\NotifyIconSettings\\" + target,
+                            0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(sk, "IsPromoted", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(sk)
+    except Exception:
+        pass
 
 
 def _render_single_ring(size: int, pct: float, color_rgba: tuple,
@@ -700,8 +766,11 @@ class JeanClaudeCombien:
         )
         self._tray_icon = pystray.Icon("JeanClaudeCombien", icon_img,
                                        title=tooltip, menu=menu)
+        self._tray_icon._uid = TRAY_UID   # see monkeypatch near imports
         self._last_tray_pcts = (self._last_pct_5h, self._last_pct_wk)
         self._tray_icon.run_detached()
+        self.root.after(1200, lambda: _promote_tray_icon(TRAY_UID,
+                                                         "JeanClaudeCombien"))
         # Windows 11 hides new tray icons in the overflow flyout by default —
         # show this once so the user knows where to look (and can pin it).
         if not self.cfg["tray_hinted"]:
