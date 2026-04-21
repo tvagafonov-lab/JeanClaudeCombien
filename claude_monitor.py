@@ -760,7 +760,15 @@ class JeanClaudeCombien:
                 err = type(e).__name__
             if err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
+                # Right after Windows sign-in / unlock the network stack may
+                # not be fully up yet — retry with short backoff so we don't
+                # end up stuck on a cold cache until the 5 min fallback.
+                retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
+                if retry_ms <= 60_000:
+                    self.root.after(retry_ms, self._bg_fetch)
+                    self._fetch_backoff_ms = retry_ms * 3
             else:
+                self._fetch_backoff_ms = 5_000   # reset backoff on success
                 self.root.after(0, self._refresh_ui)
                 # Enter tray only after the first successful fetch — the
                 # tray icon then shows real percentages, not a cold-cache 0.
