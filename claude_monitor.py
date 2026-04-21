@@ -124,9 +124,12 @@ TRAY_EDGE_MARGIN    = 0    # inset from icon edge to outermost ring (flush)
 # Stable uID + GUID let Windows 11 NotifyIconSettings register this app
 # independently of other pythonw.exe tray icons. The GUID is the field Win11
 # actually keys on; the uID is kept as a legacy fallback.
-TRAY_UID  = 0xC1A0_DE77
-TRAY_GUID = (0xC1A0DE77, 0xCAD5, 0xEAF1,
-             (0x77, 0x77, 0xC1, 0xA0, 0xDE, 0x77, 0xC1, 0xA0))
+TRAY_UID  = 0x7C1A_DE77
+# Fresh GUID (changed 2026-04-21) — Windows remembers GUID→exe bindings; if
+# a previous GUID got "stuck" on Win11 NotifyIconSettings, bumping it past
+# that snapshot makes Windows register the icon as new.
+TRAY_GUID = (0x2026A011, 0xC1A0, 0xDE77,
+             (0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x77, 0x77))
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -371,7 +374,9 @@ def _render_double_ring(size: int, pct_outer: float, pct_inner: float,
         d.arc(inner_bbox, start=-90, end=-90 + span,
               fill=inner_rgba, width=is_)
 
-    c_off = i_off + is_ + gap
+    # Center disc — flush against the inner ring's inside edge (no extra gap)
+    # so it's as big as possible and the brand color reads at 16 px.
+    c_off = i_off + is_
     d.ellipse((c_off, c_off, S - c_off - 1, S - c_off - 1), fill=accent_rgba)
     return img.resize((size, size), Image.LANCZOS)
 
@@ -859,8 +864,8 @@ class JeanClaudeCombien:
             pct_5h, pct_wk,
             ring_color(pct_5h),
             ring_color(pct_wk),
-            _pil_color(C["accent"]),
-            _pil_color(C["bar"]),   # warm-dark track matches the overlay theme
+            (255, 140,  64, 255),   # vivid orange center — Claude signature
+            (110,  70,  40, 90),    # semi-transparent warm track (alpha=90)
             TRAY_OUTER_STROKE, TRAY_INNER_STROKE,
             TRAY_RING_GAP, TRAY_EDGE_MARGIN,
         )
