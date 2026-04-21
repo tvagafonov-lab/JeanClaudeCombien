@@ -1,2 +1,4 @@
 cloudscraper>=1.2.71
 requests>=2.31.0
+pystray>=0.19
+Pillow>=10
