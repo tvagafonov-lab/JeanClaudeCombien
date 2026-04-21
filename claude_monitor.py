@@ -436,13 +436,21 @@ class JeanClaudeCombien:
         self._hover_hide_id   = None
         self._last_pct_5h     = 0.0
         self._last_pct_wk     = 0.0
+        # If tray mode is requested at startup, we defer entering it until the
+        # first `_bg_fetch` actually succeeds — otherwise the tray icon bakes
+        # in 0 % for a second or two (cache is cold before JCC even gets a
+        # chance to hit the API).
+        self._tray_wanted     = bool(self.cfg["tray"]) and TRAY_AVAILABLE
         self._build_window()
         self._build_content()
         self._fit_height()
         self._refresh_ui()
         self._schedule_bg_fetch()
-        if self.cfg["tray"] and TRAY_AVAILABLE:
-            self.root.after(200, self._enter_tray)
+        # Fallback: if the first fetch is broken / offline, still enter tray
+        # after a reasonable delay so the icon shows up (with whatever the
+        # cache has).
+        if self._tray_wanted:
+            self.root.after(5_000, self._enter_tray_if_pending)
 
     def _t(self, key: str, **kwargs) -> str:
         return i18n.get(self.cfg["lang"], key, **kwargs)
@@ -754,8 +762,18 @@ class JeanClaudeCombien:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
             else:
                 self.root.after(0, self._refresh_ui)
+                # Enter tray only after the first successful fetch — the
+                # tray icon then shows real percentages, not a cold-cache 0.
+                self.root.after(0, self._enter_tray_if_pending)
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
+
+    def _enter_tray_if_pending(self):
+        """Honor a pending startup request to enter tray mode (called once
+        the first fetch has populated the cache, or as a timeout fallback)."""
+        if self._tray_wanted and self._tray_icon is None:
+            self._tray_wanted = False   # one-shot
+            self._enter_tray()
 
     def _watch_tokens(self):
         """Every 5 s: re-fetch if buddy-tokens.json changed (30 s API cooldown)."""
