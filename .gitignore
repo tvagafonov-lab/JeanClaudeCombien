@@ -25,3 +25,7 @@ monitor_settings.json
 # OS
 Thumbs.db
 .DS_Store
+
+# PyInstaller build artifacts (users build locally via install.bat)
+*.spec
+/JeanClaudeCombien.exe
