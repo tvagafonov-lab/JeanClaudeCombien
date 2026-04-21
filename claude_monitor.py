@@ -72,7 +72,7 @@ W_COMPACT = 165
 RING_SIZE           = 40   # ring canvas size (px) in dock mode
 RING_PAD            = 2    # padding around each ring canvas
 DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # close to Win11 taskbar (44 px)
-DOCK_RING_STROKE    = 5    # ring thickness in dock mode
+DOCK_RING_STROKE    = 6    # ring thickness in dock mode
 DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
 TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
 REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
@@ -80,10 +80,10 @@ REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates
 # size (16 / 20 / 24 px depending on DPI). Pillow supersamples 4× internally
 # and LANCZOS-downsamples to 64 for antialiased ring edges.
 TRAY_ICON_SIZE      = 64
-TRAY_OUTER_STROKE   = 8    # outer ring (5h) thickness at target size
-TRAY_INNER_STROKE   = 6    # inner ring (week) thickness at target size
-TRAY_RING_GAP       = 2    # gap between outer and inner rings
-TRAY_EDGE_MARGIN    = 2    # inset from icon edge to outermost ring
+TRAY_OUTER_STROKE   = 10   # outer ring (5h) thickness at target size
+TRAY_INNER_STROKE   = 8    # inner ring (week) thickness at target size
+TRAY_RING_GAP       = 1    # gap between outer and inner rings
+TRAY_EDGE_MARGIN    = 1    # inset from icon edge to outermost ring
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -214,6 +214,15 @@ def pct_color(pct: float) -> str:
     if pct >= 90: return C["red"]
     if pct >= 60: return C["yellow"]
     return C["text"]
+
+
+def ring_color(pct: float) -> tuple:
+    """Saturated RGBA for tray/dock rings — readable at 16 px in the tray
+    and more punchy than the muted progress-bar palette used inside the
+    overlay rows."""
+    if pct >= 90: return (255,  68,  68, 255)   # bright red
+    if pct >= 60: return (255, 176,  32, 255)   # bright amber
+    return              ( 34, 220,  85, 255)    # bright lime
 
 
 def _pil_color(hex_str: str) -> tuple:
@@ -590,7 +599,7 @@ class JeanClaudeCombien:
         display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
         if TRAY_AVAILABLE:
             img = _render_single_ring(RING_SIZE, display_pct,
-                                      _pil_color(color),
+                                      ring_color(pct),
                                       _pil_color(C["bar"]),
                                       DOCK_RING_STROKE)
             photo = ImageTk.PhotoImage(img)
@@ -704,9 +713,10 @@ class JeanClaudeCombien:
             return
         try:
             self._tray_icon.notify(
-                "Expand the tray overflow (^) on the taskbar to see the icon, "
-                "then drag it out to pin it.",
-                "JeanClaudeCombien is now in the system tray",
+                "Click ^ on the taskbar to expand the overflow. If the icon "
+                "isn't there either, open Settings → Personalisation → "
+                "Taskbar → Other system tray icons and enable pythonw.exe.",
+                "JeanClaudeCombien is in the system tray",
             )
         except Exception:
             pass
@@ -750,8 +760,8 @@ class JeanClaudeCombien:
         return _render_double_ring(
             TRAY_ICON_SIZE,
             pct_5h, pct_wk,
-            _pil_color(bar_color(pct_5h)),
-            _pil_color(bar_color(pct_wk)),
+            ring_color(pct_5h),
+            ring_color(pct_wk),
             _pil_color(C["accent"]),
             _pil_color(C["bar"]),   # warm-dark track matches the overlay theme
             TRAY_OUTER_STROKE, TRAY_INNER_STROKE,
