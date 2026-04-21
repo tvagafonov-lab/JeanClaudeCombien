@@ -69,8 +69,11 @@ for /f "delims=" %%p in ('where python') do (
 set PYTHONW=!PYTHONDIR!pythonw.exe
 if not exist "!PYTHONW!" set PYTHONW=python.exe
 
+:: Удаляем устаревший ярлык (старое имя / указывающий на несуществующий .bat)
+if exist "!STARTUP!\ClaudeMonitor.lnk" del "!STARTUP!\ClaudeMonitor.lnk"
+
 :: Создаём ярлык через PowerShell (одна строка, надёжно)
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('!STARTUP!\ClaudeMonitor.lnk'); $s.TargetPath='!PYTHONW!'; $s.Arguments='\"!SCRIPT!\"'; $s.WorkingDirectory='!WORKDIR!'; $s.WindowStyle=7; $s.Save()"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('!STARTUP!\JeanClaudeCombien.lnk'); $s.TargetPath='!PYTHONW!'; $s.Arguments='\"!SCRIPT!\"'; $s.WorkingDirectory='!WORKDIR!'; $s.WindowStyle=7; $s.Description='JeanClaudeCombien overlay'; $s.Save()"
 
 if errorlevel 1 (
     echo  [Предупреждение] Ярлык создать не удалось — создай вручную.
