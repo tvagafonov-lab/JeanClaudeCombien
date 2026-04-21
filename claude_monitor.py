@@ -406,6 +406,11 @@ class JeanClaudeCombien:
             w, h = self.root.winfo_width(), self.root.winfo_height()
         except Exception:
             return
+        # Before Tk finishes laying out, winfo_width/height can return 1 from
+        # the intermediate `{W}x1+{x}+{y}` set in _build_content. Reposition
+        # decisions made then would put the window at nonsense coordinates.
+        if w < 50 or h < 40:
+            return
         if _rect_on_screen(x, y, w, h):
             return
         if self.cfg["dock"]:
@@ -415,7 +420,9 @@ class JeanClaudeCombien:
         else:
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
             W = W_COMPACT if self.cfg["compact"] else W_FULL
-            self.root.geometry(f"+{sw - W - 20}+{sh - h - 60}")
+            # Center on the primary monitor — a deterministic visible spot
+            # that survives DPI changes and monitor reshuffling.
+            self.root.geometry(f"+{(sw - W) // 2}+{(sh - h) // 2}")
 
     # ── Mode & language ───────────────────────────────────────────────────────
     def _rebuild_ui(self):
