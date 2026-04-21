@@ -16,10 +16,11 @@ import i18n
 import fetch_usage
 
 # Tray-mode deps are optional — the overlay works fully without them if the
-# user never enables tray.
+# user never enables tray. PIL is also used for dock rings: tkinter's Canvas
+# has no AA, so we supersample through Pillow and display via ImageTk.
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageTk
     TRAY_AVAILABLE = True
 except Exception:
     TRAY_AVAILABLE = False
@@ -43,6 +44,7 @@ DEFAULT_SETTINGS = {
     "compact":        False,
     "dock":           False,
     "tray":           False,   # fourth mode: hidden overlay, system-tray icon
+    "tray_hinted":    False,   # shown the "look in overflow ^" toast once
     "dock_x":         -1,      # saved X in dock mode (-1 = default near Start)
     "lang":           "en",
     "show_remaining": False,   # False = used %, True = remaining %
@@ -67,15 +69,21 @@ C = {
 W_FULL    = 265
 W_COMPACT = 165
 
-RING_SIZE           = 36   # ring canvas size (px) in dock mode
-RING_PAD            = 3    # padding around each ring canvas
-DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # matches Win11 taskbar height
+RING_SIZE           = 40   # ring canvas size (px) in dock mode
+RING_PAD            = 2    # padding around each ring canvas
+DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # close to Win11 taskbar (44 px)
+DOCK_RING_STROKE    = 5    # ring thickness in dock mode
 DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
 TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
 REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
-TRAY_ICON_SIZE      = 32        # drawn size; Windows downscales to 16×16
-TRAY_OUTER_WIDTH    = 4         # outer ring stroke (5h)
-TRAY_INNER_WIDTH    = 3         # inner ring stroke (week)
+# Tray icons are drawn at 64×64 then Windows scales them to the active tray
+# size (16 / 20 / 24 px depending on DPI). Pillow supersamples 4× internally
+# and LANCZOS-downsamples to 64 for antialiased ring edges.
+TRAY_ICON_SIZE      = 64
+TRAY_OUTER_STROKE   = 8    # outer ring (5h) thickness at target size
+TRAY_INNER_STROKE   = 6    # inner ring (week) thickness at target size
+TRAY_RING_GAP       = 2    # gap between outer and inner rings
+TRAY_EDGE_MARGIN    = 2    # inset from icon edge to outermost ring
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -212,6 +220,61 @@ def _pil_color(hex_str: str) -> tuple:
     """Convert a '#rrggbb' string to an opaque RGBA tuple for Pillow."""
     h = hex_str.lstrip("#")
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+
+def _render_single_ring(size: int, pct: float, color_rgba: tuple,
+                        track_rgba: tuple, stroke: int,
+                        supersample: int = 4):
+    """Render an antialiased progress ring of `size`×`size` via supersampling.
+    Pillow's `arc` has no built-in AA — drawing at 4× size and LANCZOS-
+    downsampling gives clean curves at the target resolution."""
+    S = size * supersample
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d   = ImageDraw.Draw(img)
+    sw  = stroke * supersample
+    margin = 3 * supersample
+    bbox = (margin, margin, S - margin - 1, S - margin - 1)
+    d.ellipse(bbox, outline=track_rgba, width=sw)
+    if pct > 0:
+        span = max(1.0, min(359.9, 3.6 * pct))
+        d.arc(bbox, start=-90, end=-90 + span, fill=color_rgba, width=sw)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def _render_double_ring(size: int, pct_outer: float, pct_inner: float,
+                        outer_rgba: tuple, inner_rgba: tuple,
+                        accent_rgba: tuple, track_rgba: tuple,
+                        outer_stroke: int, inner_stroke: int,
+                        ring_gap: int, edge_margin: int,
+                        supersample: int = 4):
+    """Render two concentric progress rings plus a brand-colored center disc,
+    with LANCZOS supersampling for smooth edges."""
+    S  = size * supersample
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d   = ImageDraw.Draw(img)
+    em  = edge_margin  * supersample
+    os_ = outer_stroke * supersample
+    gap = ring_gap     * supersample
+    is_ = inner_stroke * supersample
+
+    outer_bbox = (em, em, S - em - 1, S - em - 1)
+    d.ellipse(outer_bbox, outline=track_rgba, width=os_)
+    if pct_outer > 0:
+        span = max(1.0, min(359.9, 3.6 * pct_outer))
+        d.arc(outer_bbox, start=-90, end=-90 + span,
+              fill=outer_rgba, width=os_)
+
+    i_off = em + os_ + gap
+    inner_bbox = (i_off, i_off, S - i_off - 1, S - i_off - 1)
+    d.ellipse(inner_bbox, outline=track_rgba, width=is_)
+    if pct_inner > 0:
+        span = max(1.0, min(359.9, 3.6 * pct_inner))
+        d.arc(inner_bbox, start=-90, end=-90 + span,
+              fill=inner_rgba, width=is_)
+
+    c_off = i_off + is_ + gap
+    d.ellipse((c_off, c_off, S - c_off - 1, S - c_off - 1), fill=accent_rgba)
+    return img.resize((size, size), Image.LANCZOS)
 
 
 def resolve_row(cache: dict, key_pct: str, key_rst: "str | None",
@@ -410,8 +473,9 @@ class JeanClaudeCombien:
             w     = self._rows_widgets[i]
 
             if w["mode"] == "dock":
-                self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
-                                self._draw_ring(c, p, col))
+                self.root.after(30 * i,
+                                lambda c=w["canvas"], p=pct, col=color, wr=w:
+                                self._draw_ring(c, p, col, wr))
             else:
                 display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
                 w["pct_var"].set(f"{display_pct:.0f}%")
@@ -519,23 +583,30 @@ class JeanClaudeCombien:
         dx, dy = self._dock_snap_pos(dw, DOCK_H)
         self.root.geometry(f"{dw}x{DOCK_H}+{dx}+{dy}")
 
-    def _draw_ring(self, canvas: tk.Canvas, pct: float, color: str):
-        """Draw a donut-ring progress indicator on canvas."""
+    def _draw_ring(self, canvas: tk.Canvas, pct: float, color: str,
+                   widget_ref: dict):
+        """Draw an antialiased ring + centered % text on a dock canvas."""
         canvas.delete("all")
-        s, p = RING_SIZE, 3
         display_pct = max(0.0, 100.0 - pct) if self.cfg["show_remaining"] else pct
-        # Background ring (full circle)
-        canvas.create_arc(p, p, s - p, s - p,
-                          start=90, extent=-359.9,
-                          style="arc", width=4, outline=C["bar"])
-        # Progress arc
-        if display_pct > 0:
-            canvas.create_arc(p, p, s - p, s - p,
-                              start=90,
-                              extent=-min(max(1.0, 3.6 * display_pct), 359.9),
-                              style="arc", width=4, outline=color)
-        # Center percentage text
-        canvas.create_text(s // 2, s // 2,
+        if TRAY_AVAILABLE:
+            img = _render_single_ring(RING_SIZE, display_pct,
+                                      _pil_color(color),
+                                      _pil_color(C["bar"]),
+                                      DOCK_RING_STROKE)
+            photo = ImageTk.PhotoImage(img)
+            widget_ref["_photo"] = photo
+            canvas.create_image(RING_SIZE // 2, RING_SIZE // 2, image=photo)
+        else:
+            p = 3
+            canvas.create_arc(p, p, RING_SIZE - p, RING_SIZE - p,
+                              start=90, extent=-359.9,
+                              style="arc", width=4, outline=C["bar"])
+            if display_pct > 0:
+                canvas.create_arc(p, p, RING_SIZE - p, RING_SIZE - p,
+                                  start=90,
+                                  extent=-min(max(1.0, 3.6 * display_pct), 359.9),
+                                  style="arc", width=4, outline=color)
+        canvas.create_text(RING_SIZE // 2, RING_SIZE // 2,
                            text=f"{display_pct:.0f}",
                            fill=color if pct >= 1 else C["muted"],
                            font=("Segoe UI", 7, "bold"))
@@ -622,6 +693,23 @@ class JeanClaudeCombien:
                                        title=tooltip, menu=menu)
         self._last_tray_pcts = (self._last_pct_5h, self._last_pct_wk)
         self._tray_icon.run_detached()
+        # Windows 11 hides new tray icons in the overflow flyout by default —
+        # show this once so the user knows where to look (and can pin it).
+        if not self.cfg["tray_hinted"]:
+            self.cfg["tray_hinted"] = True
+            self.root.after(600, self._hint_tray_location)
+
+    def _hint_tray_location(self):
+        if self._tray_icon is None:
+            return
+        try:
+            self._tray_icon.notify(
+                "Expand the tray overflow (^) on the taskbar to see the icon, "
+                "then drag it out to pin it.",
+                "JeanClaudeCombien is now in the system tray",
+            )
+        except Exception:
+            pass
 
     def _quit_from_tray(self):
         self._hide_hover_card()
@@ -656,24 +744,19 @@ class JeanClaudeCombien:
             pass
 
     def _build_tray_image(self, pct_5h: float, pct_wk: float):
-        """Render a 32x32 RGBA icon: outer arc = 5h, inner arc = week, center
-        disc in brand accent color. Windows downscales to 16x16 for the tray."""
-        s = TRAY_ICON_SIZE
-        img   = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        d     = ImageDraw.Draw(img)
-        track = (58, 37, 21, 255)   # muted warm-dark track (matches C["bar"])
-
-        def arc(bbox, pct, color, width):
-            d.ellipse(bbox, outline=track, width=width)
-            span = max(1.0, min(359.9, 3.6 * max(0.0, min(100.0, pct))))
-            d.arc(bbox, start=-90, end=-90 + span, fill=color, width=width)
-
-        arc((1, 1, s - 2, s - 2), pct_5h, _pil_color(bar_color(pct_5h)),
-            TRAY_OUTER_WIDTH)
-        arc((8, 8, s - 9, s - 9), pct_wk, _pil_color(bar_color(pct_wk)),
-            TRAY_INNER_WIDTH)
-        d.ellipse((12, 12, s - 12, s - 12), fill=_pil_color(C["accent"]))
-        return img
+        """Render the tray icon: outer ring = 5h, inner ring = week, center
+        disc in brand accent color. Drawn supersampled via Pillow for smooth
+        edges, then Windows downscales to 16/20/24 px depending on DPI."""
+        return _render_double_ring(
+            TRAY_ICON_SIZE,
+            pct_5h, pct_wk,
+            _pil_color(bar_color(pct_5h)),
+            _pil_color(bar_color(pct_wk)),
+            _pil_color(C["accent"]),
+            _pil_color(C["bar"]),   # warm-dark track matches the overlay theme
+            TRAY_OUTER_STROKE, TRAY_INNER_STROKE,
+            TRAY_RING_GAP, TRAY_EDGE_MARGIN,
+        )
 
     def _build_tray_tooltip(self, cache: "dict | None" = None,
                             now: "datetime | None" = None) -> str:
