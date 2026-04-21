@@ -8,10 +8,19 @@ Updates automatically when buddy-tokens.json changes (file watcher).
 
 import tkinter as tk
 import ctypes
-import json, os, time, subprocess, sys, threading
+from ctypes import wintypes
+import json, os, time, threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import i18n
+import fetch_usage
+
+# Win32 indices for GetSystemMetrics / SystemParametersInfo.
+SM_XVIRTUALSCREEN  = 76
+SM_YVIRTUALSCREEN  = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SPI_GETWORKAREA    = 0x0030
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 APPDATA       = Path(os.environ.get("APPDATA", Path.home()))
@@ -19,7 +28,6 @@ CLAUDE_DIR    = APPDATA / "Claude"
 TOKENS_FILE   = CLAUDE_DIR / "buddy-tokens.json"
 CACHE_FILE    = CLAUDE_DIR / "monitor_usage_cache.json"
 SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
-FETCH_SCRIPT  = Path(__file__).parent / "fetch_usage.py"
 
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
@@ -49,9 +57,12 @@ C = {
 W_FULL    = 265
 W_COMPACT = 165
 
-RING_SIZE = 36   # ring canvas size (px) in dock mode
-RING_PAD  = 3    # padding around each ring canvas
-DOCK_H    = RING_SIZE + RING_PAD * 2 + 2   # = 44 px (matches Win11 taskbar)
+RING_SIZE           = 36   # ring canvas size (px) in dock mode
+RING_PAD            = 3    # padding around each ring canvas
+DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # matches Win11 taskbar height
+DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
+TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
+REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -59,10 +70,10 @@ def _virtual_screen_rect() -> "tuple[int, int, int, int] | None":
     """Bounding box of all currently connected monitors, in screen coords."""
     try:
         u = ctypes.windll.user32
-        x = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
-        y = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
-        w = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-        h = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+        x = u.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        y = u.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        w = u.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        h = u.GetSystemMetrics(SM_CYVIRTUALSCREEN)
         return (x, y, x + w, y + h)
     except Exception:
         return None
@@ -78,7 +89,6 @@ def _rect_on_screen(x: int, y: int, w: int, h: int, min_overlap: int = 40) -> bo
     return (min(x + w, vr) - max(x, vl) >= min_overlap
             and min(y + h, vb) - max(y, vt) >= min_overlap)
 
-# Row definitions: (pct_key, reset_key, icon, i18n_key)
 ROWS = [
     # (pct_key, reset_key, icon, label_key, window_seconds)
     ("fh_pct", "fh_reset", "⏱", "row_5h",      5 * 3600),
@@ -110,13 +120,24 @@ class Settings:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+_cache_data: dict = {}
+_cache_mtime: float = 0.0
+
+
 def read_cache() -> dict:
+    """Return the parsed cache file, re-reading only when its mtime changes."""
+    global _cache_data, _cache_mtime
     try:
-        if CACHE_FILE.exists():
-            return json.loads(CACHE_FILE.read_text("utf-8"))
-    except Exception:
-        pass
-    return {}
+        mt = os.path.getmtime(CACHE_FILE)
+    except OSError:
+        return _cache_data
+    if mt != _cache_mtime:
+        try:
+            _cache_data  = json.loads(CACHE_FILE.read_text("utf-8"))
+            _cache_mtime = mt
+        except (OSError, ValueError):
+            pass
+    return _cache_data
 
 
 def _reset_dt(iso: str | None) -> "datetime | None":
@@ -129,20 +150,24 @@ def _reset_dt(iso: str | None) -> "datetime | None":
         return None
 
 
-def reset_passed(iso: str | None) -> bool:
+def reset_passed(iso: str | None, now: "datetime | None" = None) -> bool:
     """True if the given ISO timestamp is in the past."""
     dt = _reset_dt(iso)
-    return dt is not None and dt < datetime.now(tz=timezone.utc)
+    if dt is None:
+        return False
+    return dt < (now or datetime.now(tz=timezone.utc))
 
 
-def fmt_reset(iso: str | None, lang: str, window_seconds: int = 0) -> str:
+def fmt_reset(iso: str | None, lang: str, window_seconds: int = 0,
+              now: "datetime | None" = None) -> str:
     """Format an ISO timestamp into a countdown, rolling past resets forward
     by `window_seconds` so we always show the *next* expected reset."""
     tr = i18n.STRINGS.get(lang, i18n.STRINGS["en"])
     dt = _reset_dt(iso)
     if dt is None:
         return "—"
-    now  = datetime.now(tz=timezone.utc)
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
     diff = dt - now
     if diff.total_seconds() < 0:
         if window_seconds <= 0:
@@ -332,10 +357,11 @@ class JeanClaudeCombien:
     def _refresh_ui(self):
         cache = read_cache()
         lang  = self.cfg["lang"]
+        now   = datetime.now(tz=timezone.utc)   # single snapshot for the whole tick
 
         for i, (key_pct, key_rst, icon, name_key, win_s) in enumerate(ROWS):
             pct = float(cache.get(key_pct, 0))
-            if key_rst is not None and reset_passed(cache.get(key_rst)):
+            if key_rst is not None and reset_passed(cache.get(key_rst), now):
                 pct = 0.0  # stale cache after window rollover
             color = bar_color(pct)
             w     = self._rows_widgets[i]
@@ -346,7 +372,7 @@ class JeanClaudeCombien:
                 curr    = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
                 rst_txt = f"{used:.2f} / {limit:.2f} {curr}"
             else:
-                rst_txt = fmt_reset(cache.get(key_rst), lang, win_s)
+                rst_txt = fmt_reset(cache.get(key_rst), lang, win_s, now)
 
             if w["mode"] == "dock":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
@@ -364,7 +390,7 @@ class JeanClaudeCombien:
             try:
                 dt = datetime.fromisoformat(cache["fetched_at"])
                 self._upd_var.set(f"⟳ {dt.astimezone().strftime('%H:%M')}")
-            except Exception:
+            except (ValueError, TypeError):
                 pass
 
         self._reclaim_if_offscreen()
@@ -419,19 +445,19 @@ class JeanClaudeCombien:
         return len(ROWS) * (RING_SIZE + RING_PAD * 2) + 4
 
     def _dock_snap_pos(self, w: int, h: int) -> tuple:
-        """Y: just above primary-monitor taskbar (SPI_GETWORKAREA).
-        X: saved dock_x, or 80 near Start button. Falls back to the primary
-        monitor if the saved X is stranded on a disconnected monitor."""
+        """Y: just above primary-monitor taskbar. X: saved dock_x, or a small
+        default near the Start button. Falls back to the primary monitor if
+        the saved X is stranded on a disconnected monitor."""
         try:
-            from ctypes import wintypes
             wa = wintypes.RECT()
-            ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(wa), 0)
+            ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(wa), 0)
             y = wa.bottom - h
         except Exception:
-            y = self.root.winfo_screenheight() - h - 48  # 48 px fallback
-        x = self.cfg["dock_x"] if self.cfg["dock_x"] >= 0 else 80
+            y = self.root.winfo_screenheight() - h - TASKBAR_FALLBACK_H
+        x = self.cfg["dock_x"] if self.cfg["dock_x"] >= 0 else DOCK_DEFAULT_X
         if not _rect_on_screen(x, y, w, h):
-            x = 80
+            x = DOCK_DEFAULT_X
         return x, y
 
     def _build_dock(self):
@@ -476,12 +502,15 @@ class JeanClaudeCombien:
     # ── Background fetch ──────────────────────────────────────────────────────
     def _bg_fetch(self):
         def run():
+            err = None
             try:
-                subprocess.run([sys.executable, str(FETCH_SCRIPT)],
-                               timeout=40, capture_output=True)
-                self.root.after(500, self._refresh_ui)
-            except Exception:
-                pass
+                fetch_usage.fetch_and_save()
+            except Exception as e:
+                err = type(e).__name__
+            if err:
+                self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
+            else:
+                self.root.after(0, self._refresh_ui)
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
 
@@ -508,7 +537,7 @@ class JeanClaudeCombien:
         self._bg_fetch()
         self.root.after(5_000, self._watch_tokens)
         # Fallback: re-fetch every 5 min regardless (browser use, session refresh)
-        self.root.after(300_000, self._schedule_bg_fetch)
+        self.root.after(REFETCH_INTERVAL_MS, self._schedule_bg_fetch)
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e): self._ox, self._oy = e.x, e.y
@@ -540,27 +569,30 @@ class JeanClaudeCombien:
         m.add_command(label=self._t(pct_key), command=self._toggle_show_remaining)
         m.add_separator()
 
-        # Opacity submenu
-        sub2 = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
-                       activebackground=C["accent"], font=("Segoe UI", 9))
-        for a in (1.0, 0.92, 0.80, 0.60):
-            mark = "✓  " if abs(self.cfg["opacity"] - a) < 0.01 else "    "
-            sub2.add_command(label=f"{mark}{int(a * 100)}%",
-                             command=lambda a=a: self._set_opacity(a))
-        m.add_cascade(label=self._t("menu_opacity"), menu=sub2)
+        opacity_items = [(a, f"{int(a * 100)}%") for a in (1.0, 0.92, 0.80, 0.60)]
+        m.add_cascade(label=self._t("menu_opacity"),
+                      menu=self._submenu(m, opacity_items, self.cfg["opacity"],
+                                         self._set_opacity,
+                                         eq=lambda a, b: abs(a - b) < 0.01))
 
-        # Language submenu
-        sub3 = tk.Menu(m, tearoff=0, bg=C["bg2"], fg=C["text"],
-                       activebackground=C["accent"], font=("Segoe UI", 9))
-        for code, label in i18n.LANGUAGES.items():
-            mark = "✓  " if lang == code else "    "
-            sub3.add_command(label=f"{mark}{label}",
-                             command=lambda c=code: self._set_lang(c))
-        m.add_cascade(label=self._t("menu_language"), menu=sub3)
+        lang_items = list(i18n.LANGUAGES.items())
+        m.add_cascade(label=self._t("menu_language"),
+                      menu=self._submenu(m, lang_items, lang, self._set_lang))
 
         m.add_separator()
         m.add_command(label=self._t("menu_close"), command=self.root.destroy)
         m.post(e.x_root, e.y_root)
+
+    def _submenu(self, parent, items, current, on_select, eq=None):
+        """Build a submenu with a ✓-prefix on the item matching `current`."""
+        sub = tk.Menu(parent, tearoff=0, bg=C["bg2"], fg=C["text"],
+                      activebackground=C["accent"], font=("Segoe UI", 9))
+        match = eq or (lambda a, b: a == b)
+        for value, label in items:
+            mark = "✓  " if match(current, value) else "    "
+            sub.add_command(label=f"{mark}{label}",
+                            command=lambda v=value: on_select(v))
+        return sub
 
     def _set_opacity(self, v):
         self.cfg["opacity"] = v

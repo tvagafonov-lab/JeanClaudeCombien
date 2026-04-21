@@ -2,7 +2,7 @@
 Получает данные с claude.ai через cloudscraper + sessionKey.
 Сохраняет в monitor_usage_cache.json.
 """
-import json, os
+import json, os, threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -10,16 +10,28 @@ APPDATA    = Path(os.environ.get("APPDATA", Path.home()))
 CLAUDE_DIR = APPDATA / "Claude"
 CACHE_FILE = CLAUDE_DIR / "monitor_usage_cache.json"
 SESSION    = CLAUDE_DIR / "monitor_session.json"
-ORG_CACHE  = CLAUDE_DIR / "monitor_org.json"   # кэшируем org_id
+ORG_CACHE  = CLAUDE_DIR / "monitor_org.json"
+
+
+# Reusable cloudscraper session — TLS handshake + JS-challenge prep costs
+# ~200 ms on first use. Guarded by a lock because startup fires the initial
+# fetch on one daemon thread while the watcher can fire again seconds later.
+_scraper: "object | None" = None
+_scraper_key: "str | None" = None
+_scraper_lock = threading.Lock()
 
 
 def _get_scraper(key: str):
-    import cloudscraper
-    s = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    s.cookies.set("sessionKey", key, domain="claude.ai")
-    return s
+    global _scraper, _scraper_key
+    with _scraper_lock:
+        if _scraper is None or _scraper_key != key:
+            import cloudscraper
+            _scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            _scraper.cookies.set("sessionKey", key, domain="claude.ai")
+            _scraper_key = key
+        return _scraper
 
 
 def _get_org_id(s) -> str:
