@@ -15,6 +15,44 @@ from datetime import datetime, timedelta, timezone
 import i18n
 import fetch_usage
 
+# Distinct AppUserModelID so Win11 shell treats this pythonw.exe instance
+# as its own application (separate from any sibling overlay like CHB).
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "JeanClaudeCombien.Overlay.1")
+except Exception:
+    pass
+
+# Tray-mode deps. Pystray+Pillow are optional — if they're missing the
+# overlay still works in full / compact / dock. PIL is also used for
+# antialiased dock rings via supersampling + LANCZOS downscale.
+try:
+    import pystray
+    import pystray._win32 as _pystray_win32
+    from pystray._win32 import win32 as _pystray_w32
+    from PIL import Image, ImageDraw, ImageTk
+    TRAY_AVAILABLE = True
+
+    def _pystray_message_patched(self, code, flags, **kwargs):
+        guid = getattr(self, "_guid", None)
+        if guid is not None:
+            flags |= _pystray_w32.NIF_GUID
+            kwargs["guidItem"] = guid
+        _pystray_w32.Shell_NotifyIcon(code, _pystray_w32.NOTIFYICONDATAW(
+            cbSize=ctypes.sizeof(_pystray_w32.NOTIFYICONDATAW),
+            hWnd=self._hwnd,
+            hID=getattr(self, "_uid", None) or id(self),
+            uFlags=flags,
+            **kwargs))
+    _pystray_win32.Icon._message = _pystray_message_patched
+
+    def _make_guid(d1, d2, d3, d4):
+        G = _pystray_w32.NOTIFYICONDATAW.GUID
+        return G(Data1=d1, Data2=d2, Data3=d3,
+                 Data4=(ctypes.c_ubyte * 8)(*d4))
+except Exception:
+    TRAY_AVAILABLE = False
+
 # Win32 indices for GetSystemMetrics / SystemParametersInfo.
 SM_XVIRTUALSCREEN  = 76
 SM_YVIRTUALSCREEN  = 77
@@ -33,6 +71,7 @@ DEFAULT_SETTINGS = {
     "opacity":        0.92,
     "compact":        False,
     "dock":           False,
+    "tray":           False,   # fourth mode: hidden window, system-tray icon
     "dock_x":         -1,      # saved X in dock mode (-1 = default near Start)
     "lang":           "en",
     "show_remaining": False,   # False = used %, True = remaining %
@@ -62,7 +101,18 @@ RING_PAD            = 3    # padding around each ring canvas
 DOCK_H              = RING_SIZE + RING_PAD * 2 + 2   # matches Win11 taskbar height
 DOCK_DEFAULT_X      = 80   # default dock X near the Win11 Start button
 TASKBAR_FALLBACK_H  = 48   # assumed taskbar height if SPI_GETWORKAREA fails
-REFETCH_INTERVAL_MS = 300_000   # session-refresh fallback (browser path updates cookies)
+REFETCH_INTERVAL_MS = 180_000   # 3-min fallback re-fetch (symmetric with CHB)
+
+# Tray icon — drawn at 64×64 and downscaled by Windows to 16/20/24 px.
+# Pillow supersamples 4× and LANCZOS-downsamples for antialiased edges.
+TRAY_ICON_SIZE      = 64
+TRAY_RING_STROKE    = 14   # outer ring thickness at target size
+TRAY_EDGE_MARGIN    = 1    # inset from icon edge
+# Stable identity (do NOT change). Windows 11 binds (GUID→exe) at first
+# NIM_ADD and refuses fresh GUID registrations from the same exe later.
+TRAY_UID  = 0xC1A0_DE77
+TRAY_GUID = (0xC1A0DE77, 0xCAD5, 0xEAF1,
+             (0x77, 0x77, 0xC1, 0xA0, 0xDE, 0x77, 0xC1, 0xA0))
 
 
 # ── Multi-monitor helpers ─────────────────────────────────────────────────────
@@ -195,6 +245,49 @@ def pct_color(pct: float) -> str:
     return C["text"]
 
 
+def ring_color(pct: float) -> tuple:
+    """Saturated RGBA for tray/dock rings — reads at 16 px in the tray."""
+    if pct >= 90: return (255,  68,  68, 255)
+    if pct >= 60: return (255, 176,  32, 255)
+    return              ( 34, 220,  85, 255)
+
+
+def _pil_color(hex_str: str) -> tuple:
+    """Convert '#rrggbb' to an opaque RGBA tuple for Pillow."""
+    h = hex_str.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+
+def _render_single_ring(size, pct, color_rgba, track_rgba, stroke,
+                        supersample=4, center_rgba=None, edge_margin=3,
+                        outline_rgba=None, outline_width=1):
+    """Render a progress ring of `size`×`size` via 4× supersampling.
+    Optional center disc + thin contour on both ring edges."""
+    S = size * supersample
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d   = ImageDraw.Draw(img)
+    sw  = stroke * supersample
+    margin = edge_margin * supersample
+    ow  = outline_width * supersample
+
+    bbox = (margin, margin, S - margin - 1, S - margin - 1)
+    d.ellipse(bbox, outline=track_rgba, width=sw)
+    if pct > 0:
+        span = max(1.0, min(359.9, 3.6 * pct))
+        d.arc(bbox, start=-90, end=-90 + span, fill=color_rgba, width=sw)
+
+    if outline_rgba is not None and ow > 0:
+        d.ellipse(bbox, outline=outline_rgba, width=ow)
+        ie = margin + sw - ow
+        d.ellipse((ie, ie, S - ie - 1, S - ie - 1),
+                  outline=outline_rgba, width=ow)
+
+    if center_rgba is not None:
+        c = margin + sw
+        d.ellipse((c, c, S - c - 1, S - c - 1), fill=center_rgba)
+    return img.resize((size, size), Image.LANCZOS)
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class JeanClaudeCombien:
     def __init__(self):
@@ -205,11 +298,21 @@ class JeanClaudeCombien:
         self._known_mtime     = 0.0
         self._last_fetch_time = 0.0
         self._refresh_id      = None
+        # Tray state — deferred entry so the icon doesn't bake in 0 % on
+        # the initial cold-cache refresh.
+        self._tray_icon       = None
+        self._hover_card      = None
+        self._hover_hide_id   = None
+        self._last_pct_5h     = 0.0
+        self._last_pct_wk     = 0.0
+        self._tray_wanted     = bool(self.cfg["tray"]) and TRAY_AVAILABLE
         self._build_window()
         self._build_content()
         self._fit_height()
         self._refresh_ui()
         self._schedule_bg_fetch()
+        if self._tray_wanted:
+            self.root.after(5_000, self._enter_tray_if_pending)
 
     def _t(self, key: str, **kwargs) -> str:
         return i18n.get(self.cfg["lang"], key, **kwargs)
@@ -363,6 +466,8 @@ class JeanClaudeCombien:
             pct = float(cache.get(key_pct, 0))
             if key_rst is not None and reset_passed(cache.get(key_rst), now):
                 pct = 0.0  # stale cache after window rollover
+            if   key_pct == "fh_pct": self._last_pct_5h = pct
+            elif key_pct == "wd_pct": self._last_pct_wk = pct
             color = bar_color(pct)
             w     = self._rows_widgets[i]
 
@@ -394,6 +499,9 @@ class JeanClaudeCombien:
                 pass
 
         self._reclaim_if_offscreen()
+
+        if self.cfg["tray"] and self._tray_icon is not None:
+            self._update_tray(cache, now)
 
         if self._refresh_id is not None:
             self.root.after_cancel(self._refresh_id)
@@ -514,12 +622,210 @@ class JeanClaudeCombien:
                 fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
+                # A TLS / Cloudflare hiccup leaves the cached Scraper in a
+                # state where every subsequent call raises the same error.
+                # Reset so the next attempt rebuilds a fresh session.
+                try:
+                    fetch_usage._scraper = None
+                    fetch_usage._scraper_key = None
+                except Exception:
+                    pass
             if err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
+                # Right after sign-in the network stack may not be up yet —
+                # retry with exponential backoff so we don't sit on a cold
+                # cache until the 3-min fallback.
+                retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
+                if retry_ms <= 60_000:
+                    self.root.after(retry_ms, self._bg_fetch)
+                    self._fetch_backoff_ms = retry_ms * 3
             else:
+                self._fetch_backoff_ms = 5_000
                 self.root.after(0, self._refresh_ui)
+                # Enter tray only once the cache is populated so the icon's
+                # first render already has real percentages.
+                self.root.after(0, self._enter_tray_if_pending)
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
+
+    # ── Tray mode ─────────────────────────────────────────────────────────────
+    def _enter_tray_if_pending(self):
+        """Honor a pending startup request to enter tray (called once after
+        the first fetch succeeds, or by a 5 s fallback timer)."""
+        if self._tray_wanted and self._tray_icon is None:
+            self._tray_wanted = False
+            self._enter_tray()
+
+    def _toggle_tray(self):
+        if not TRAY_AVAILABLE:
+            return
+        if self.cfg["tray"]:
+            self._exit_tray()
+        else:
+            self._enter_tray()
+
+    def _enter_tray(self):
+        """Hide overlay, spawn a system-tray icon. Abort cleanly on any
+        rendering / pystray failure so the window isn't left withdrawn
+        with no tray control to bring it back."""
+        try:
+            icon_img = self._build_tray_image(self._last_pct_5h, self._last_pct_wk)
+            tooltip  = self._build_tray_tooltip()
+        except Exception:
+            return
+        self.cfg["tray"] = True
+        self.root.withdraw()
+
+        def on_show(icon, item):    self.root.after(0, self._show_hover_card)
+        def on_restore(icon, item): self.root.after(0, self._exit_tray)
+        def on_quit(icon, item):
+            self.cfg["tray"] = False
+            try: icon.stop()
+            except Exception: pass
+            self.root.after(0, self._quit_from_tray)
+
+        menu = pystray.Menu(
+            pystray.MenuItem(self._t("menu_tray"), on_show, default=True, visible=False),
+            pystray.MenuItem(self._t("menu_exit_tray"), on_restore),
+            pystray.MenuItem(self._t("menu_close"), on_quit),
+        )
+        self._tray_icon = pystray.Icon("JeanClaudeCombien", icon_img,
+                                       title=tooltip, menu=menu)
+        self._tray_icon._uid  = TRAY_UID
+        self._tray_icon._guid = _make_guid(*TRAY_GUID)
+        self._last_tray_pcts  = (self._last_pct_5h, self._last_pct_wk)
+        self._tray_icon.run_detached()
+
+    def _exit_tray(self):
+        self.cfg["tray"] = False
+        if self._tray_icon is not None:
+            try: self._tray_icon.stop()
+            except Exception: pass
+            self._tray_icon = None
+        self._hide_hover_card()
+        self.root.deiconify()
+
+    def _quit_from_tray(self):
+        self._hide_hover_card()
+        try: self.root.destroy()
+        except Exception: pass
+
+    def _update_tray(self, cache: dict, now: "datetime"):
+        if self._tray_icon is None:
+            return
+        pcts = (self._last_pct_5h, self._last_pct_wk)
+        if pcts == getattr(self, "_last_tray_pcts", None):
+            self._tray_icon.title = self._build_tray_tooltip(cache, now)
+            return
+        try:
+            self._tray_icon.icon  = self._build_tray_image(*pcts)
+            self._tray_icon.title = self._build_tray_tooltip(cache, now)
+            self._last_tray_pcts  = pcts
+        except Exception:
+            pass
+
+    def _build_tray_image(self, pct_5h: float, pct_wk: float):
+        """One bold ring (5h) + bright brand-tinted near-white center disc."""
+        return _render_single_ring(
+            TRAY_ICON_SIZE, pct_5h,
+            ring_color(pct_5h),
+            (110, 70, 40, 90),                 # semi-transparent warm track
+            TRAY_RING_STROKE,
+            center_rgba=(255, 230, 200, 255),  # near-white with Claude tint
+            edge_margin=TRAY_EDGE_MARGIN,
+            outline_rgba=(60, 30, 10, 220),    # dark warm contour
+            outline_width=1,
+        )
+
+    def _build_tray_tooltip(self, cache: "dict | None" = None,
+                            now: "datetime | None" = None) -> str:
+        if cache is None: cache = read_cache()
+        if now   is None: now   = datetime.now(tz=timezone.utc)
+        lang  = self.cfg["lang"]
+        lines = ["JeanClaudeCombien"]
+        for key_pct, key_rst, icon, name_key, win_s in ROWS:
+            name = i18n.get(lang, name_key)
+            if key_rst is None:
+                used  = cache.get("ex_used",  0)
+                limit = cache.get("ex_limit", 0)
+                curr  = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
+                lines.append(f"{icon} {name}: {used:.2f} / {limit:.2f} {curr}".rstrip())
+            else:
+                pct = float(cache.get(key_pct, 0))
+                if reset_passed(cache.get(key_rst), now):
+                    pct = 0.0
+                rst = fmt_reset(cache.get(key_rst), lang, win_s, now)
+                lines.append(f"{icon} {name}: {pct:.0f}%   {rst}")
+        return "\n".join(lines)[:127]
+
+    def _show_hover_card(self):
+        self._hide_hover_card()
+        card = tk.Toplevel(self.root)
+        card.overrideredirect(True)
+        card.attributes("-topmost", True)
+        card.attributes("-alpha", self.cfg["opacity"])
+        card.configure(bg=C["bg"])
+
+        hdr = tk.Frame(card, bg=C["hdr"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="◆ JeanClaudeCombien", bg=C["hdr"], fg=C["accent"],
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=7, pady=3)
+        close = tk.Label(hdr, text="✕", bg=C["hdr"], fg=C["muted"],
+                         font=("Segoe UI", 9), cursor="hand2")
+        close.pack(side="right", padx=5)
+        close.bind("<Button-1>", lambda _: self._hide_hover_card())
+
+        body = tk.Frame(card, bg=C["bg"], padx=10, pady=6)
+        body.pack(fill="x")
+        cache = read_cache()
+        lang  = self.cfg["lang"]
+        now   = datetime.now(tz=timezone.utc)
+        for key_pct, key_rst, icon, name_key, win_s in ROWS:
+            row = tk.Frame(body, bg=C["bg"])
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{icon} {i18n.get(lang, name_key)}",
+                     bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8),
+                     width=12, anchor="w").pack(side="left")
+            if key_rst is None:
+                used  = cache.get("ex_used",  0)
+                limit = cache.get("ex_limit", 0)
+                curr  = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
+                tk.Label(row, text=f"{used:.2f} / {limit:.2f} {curr}",
+                         bg=C["bg"], fg=C["text"], font=("Segoe UI", 8)).pack(side="left")
+            else:
+                pct = float(cache.get(key_pct, 0))
+                if reset_passed(cache.get(key_rst), now):
+                    pct = 0.0
+                tk.Label(row, text=f"{pct:.0f}%", bg=C["bg"], fg=pct_color(pct),
+                         font=("Segoe UI", 8, "bold"), width=5, anchor="e").pack(side="left")
+                tk.Label(row, text=fmt_reset(cache.get(key_rst), lang, win_s, now),
+                         bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8)
+                         ).pack(side="left", padx=(6, 0))
+
+        card.update_idletasks()
+        w, h = card.winfo_reqwidth(), card.winfo_reqheight()
+        cx, cy = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        x, y = cx - w // 2, cy - h - 12
+        vs = _virtual_screen_rect() or (0, 0, 1920, 1080)
+        vl, vt, vr, vb = vs
+        x = max(vl + 4, min(x, vr - w - 4))
+        y = max(vt + 4, min(y, vb - h - 4))
+        card.geometry(f"{w}x{h}+{x}+{y}")
+        card.bind("<FocusOut>",   lambda _: self._hide_hover_card())
+        card.bind("<Button-1>",   lambda _: self._hide_hover_card())
+        card.focus_force()
+        self._hover_card    = card
+        self._hover_hide_id = self.root.after(8_000, self._hide_hover_card)
+
+    def _hide_hover_card(self):
+        if self._hover_hide_id is not None:
+            try: self.root.after_cancel(self._hover_hide_id)
+            except Exception: pass
+            self._hover_hide_id = None
+        if self._hover_card is not None:
+            try: self._hover_card.destroy()
+            except Exception: pass
+            self._hover_card = None
 
     def _watch_tokens(self):
         """Every 5 s: re-fetch if buddy-tokens.json changed (30 s API cooldown)."""
@@ -541,9 +847,14 @@ class JeanClaudeCombien:
         except Exception:
             self._known_mtime = 0.0
         self._last_fetch_time = time.time()
-        self._bg_fetch()
+        # Small delay on the *first* fetch after startup so the Windows
+        # network stack has time to come up — the most common cause of
+        # first-fetch failure after sign-in / unlock.
+        delay = 0 if getattr(self, "_first_fetch_done", False) else 3_000
+        self._first_fetch_done = True
+        self.root.after(delay, self._bg_fetch)
         self.root.after(5_000, self._watch_tokens)
-        # Fallback: re-fetch every 5 min regardless (browser use, session refresh)
+        # Fallback: re-fetch every 3 min regardless (browser use, session refresh)
         self.root.after(REFETCH_INTERVAL_MS, self._schedule_bg_fetch)
 
     # ── Drag ──────────────────────────────────────────────────────────────────
@@ -571,6 +882,8 @@ class JeanClaudeCombien:
             mode_key = "menu_full" if self.cfg["compact"] else "menu_compact"
             m.add_command(label=self._t(mode_key), command=self._toggle_compact)
             m.add_command(label=self._t("menu_dock"), command=self._toggle_dock)
+            if TRAY_AVAILABLE:
+                m.add_command(label=self._t("menu_tray"), command=self._toggle_tray)
 
         pct_key = "menu_show_used" if self.cfg["show_remaining"] else "menu_show_remaining"
         m.add_command(label=self._t(pct_key), command=self._toggle_show_remaining)
