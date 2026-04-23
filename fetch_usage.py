@@ -26,12 +26,29 @@ def _get_scraper(key: str):
     return s
 
 
-def _get_org_id(s) -> str:
-    """Определяет org_id через API и кэширует на диск."""
+def _is_expired(r) -> bool:
+    """True if the HTTP response indicates sessionKey is no longer valid.
+    Covers both raw 401/403 and the JSON error shape Anthropic returns
+    through their Cloudflare layer with HTTP 200-looking bodies."""
+    if r.status_code in (401, 403):
+        return True
+    try:
+        err = r.json().get("error", {})
+        code = (err.get("details") or {}).get("error_code", "")
+        return code == "account_session_invalid"
+    except (ValueError, AttributeError):
+        return False
+
+
+def _get_org_id(s) -> str | None:
+    """Returns the cached org_id, or fetches and caches it. Returns None
+    when the sessionKey was rejected (caller surfaces `error: expired`)."""
     if ORG_CACHE.exists():
         return json.loads(ORG_CACHE.read_text("utf-8"))["org_id"]
-    orgs = s.get("https://claude.ai/api/organizations", timeout=10).json()
-    org_id = orgs[0]["uuid"]
+    r = s.get("https://claude.ai/api/organizations", timeout=10)
+    if _is_expired(r):
+        return None
+    org_id = r.json()[0]["uuid"]
     ORG_CACHE.write_text(json.dumps({"org_id": org_id}), encoding="utf-8")
     return org_id
 
@@ -46,10 +63,17 @@ def fetch_and_save() -> dict:
 
     s      = _get_scraper(key)
     org_id = _get_org_id(s)
+    if org_id is None:
+        return {"error": "expired"}
 
-    usage = s.get(
+    r = s.get(
         f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
-    ).json()
+    )
+    if _is_expired(r):
+        # org_id cache may be stale too after a re-login flipped orgs.
+        ORG_CACHE.unlink(missing_ok=True)
+        return {"error": "expired"}
+    usage = r.json()
 
     fh = usage.get("five_hour")          or {}
     sd = usage.get("seven_day")          or {}

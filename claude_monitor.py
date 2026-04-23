@@ -9,7 +9,7 @@ Updates automatically when buddy-tokens.json changes (file watcher).
 import tkinter as tk
 import ctypes
 from ctypes import wintypes
-import json, os, time, threading
+import json, os, sys, subprocess, time, threading
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import i18n
@@ -618,8 +618,9 @@ class JeanClaudeCombien:
     def _bg_fetch(self):
         def run():
             err = None
+            result = None
             try:
-                fetch_usage.fetch_and_save()
+                result = fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
                 # A TLS / Cloudflare hiccup leaves the cached Scraper in a
@@ -630,7 +631,11 @@ class JeanClaudeCombien:
                     fetch_usage._scraper_key = None
                 except Exception:
                     pass
-            if err:
+            expired = isinstance(result, dict) and result.get("error") in ("expired", "no_session")
+            if expired:
+                self.root.after(0, lambda: self._upd_var.set("⚠ session"))
+                self.root.after(0, self._prompt_session_refresh)
+            elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —
                 # retry with exponential backoff so we don't sit on a cold
@@ -647,6 +652,24 @@ class JeanClaudeCombien:
                 self.root.after(0, self._enter_tray_if_pending)
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
+
+    def _prompt_session_refresh(self):
+        """Spawn the setup dialog when Claude returned 401/403 or the
+        session file is missing. One-at-a-time: if the previous dialog
+        is still open we do nothing and let the user finish."""
+        proc = getattr(self, "_setup_proc", None)
+        if proc is not None and proc.poll() is None:
+            return
+        setup_path = Path(__file__).with_name("setup.py")
+        if not setup_path.exists():
+            return
+        try:
+            self._setup_proc = subprocess.Popen(
+                [sys.executable, str(setup_path)],
+                cwd=str(setup_path.parent),
+            )
+        except OSError:
+            self._setup_proc = None
 
     # ── Tray mode ─────────────────────────────────────────────────────────────
     def _enter_tray_if_pending(self):
