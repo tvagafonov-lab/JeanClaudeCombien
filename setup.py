@@ -32,8 +32,8 @@ sk-ant-sid02-XXXXXXXXXXXXXXXXXXXX...
 def run_gui():
     root = tk.Tk()
     root.title("JeanClaudeCombien — Setup")
-    root.geometry("480x420")
-    root.resizable(False, False)
+    root.geometry("480x540")
+    root.minsize(480, 540)
     root.configure(bg="#0d0d1a")
 
     fg_accent = "#7b61ff"
