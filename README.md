@@ -23,10 +23,11 @@ No browser tab juggling. No digging through settings.
 
 Color-coded progress bars / rings: green → yellow → red as limits approach.
 
-**Three modes:**
+**Four modes:**
 - **Full** — progress bars + labels + reset countdowns
 - **Compact** — icon + % + time to reset (165 px wide)
 - **Dock** — donut-ring strip (44 px tall) that snaps above the Windows taskbar
+- **Tray** — single status ring in the system tray; left-click for hover card, right-click for menu
 
 Double-click the header to toggle full ↔ compact. Right-click → ⊞ Dock mode to go minimal.
 
@@ -170,10 +171,16 @@ User data (not in repo, stored in `%APPDATA%\Claude\`):
 → Your sessionKey expired. Re-run `setup.py` with a fresh key.
 
 **HTTP 401 / 403 errors**  
-→ Session expired. Re-run `setup.py`.
+→ Session expired. The overlay auto-opens the setup window when this happens — paste a fresh sessionKey there. If the window doesn't appear within ~60 s, run `python setup.py` manually.
 
 **Window not visible**  
 → It may be off-screen. Delete `%APPDATA%\Claude\monitor_settings.json` and restart — it will reappear in the bottom-right corner.
+
+**Tray icon doesn't appear**  
+→ Windows 11 hides new tray icons by default. Open **Settings → Personalization → Taskbar → Other system tray icons** and enable the JeanClaudeCombien entry.
+
+**Tray icon disappears after I kill / restart the overlay**  
+→ Known Win11 quirk. The shell caches `(ExecutablePath, GUID)` pairs for `NotifyIcon` registrations and silently rejects re-registration of the same GUID inside an already-running session. Fix: **sign out of Windows and sign back in**. The autostart shortcut will then start in a clean shell state and register the tray icon cleanly. Avoid `Stop-Process` / Task-Manager-killing the overlay during a session — toggle out of tray via right-click → "Exit tray" instead.
 
 **"Python not found" in install.bat**  
 → Reinstall Python from [python.org](https://python.org/downloads/) and check **"Add Python to PATH"**.
