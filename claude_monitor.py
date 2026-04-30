@@ -623,16 +623,9 @@ class JeanClaudeCombien:
                 result = fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
-                # A TLS / Cloudflare hiccup leaves the cached Scraper in a
-                # state where every subsequent call raises the same error.
-                # Reset so the next attempt rebuilds a fresh session.
-                try:
-                    fetch_usage._scraper = None
-                    fetch_usage._scraper_key = None
-                except Exception:
-                    pass
             expired = isinstance(result, dict) and result.get("error") in ("expired", "no_session")
             if expired:
+                self._fetch_backoff_ms = 5_000   # don't drift the network-error backoff into the auth flow
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
                 self.root.after(0, self._prompt_session_refresh)
             elif err:

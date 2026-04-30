@@ -2,7 +2,7 @@
 Первоначальная настройка Claude Monitor.
 Запускать один раз: python setup.py
 """
-import json, os, sys, subprocess, webbrowser
+import json, os, webbrowser
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
@@ -109,22 +109,21 @@ def run_gui():
         status_lbl.config(fg=fg_muted)
         root.update()
 
-        # Тестовый запрос
+        # Тестовый запрос — импортим напрямую, без subprocess
         try:
-            result = subprocess.run(
-                [sys.executable,
-                 str(Path(__file__).parent / "fetch_usage.py")],
-                capture_output=True, text=True, timeout=30
-            )
-            if "error" in result.stdout.lower() or result.returncode != 0:
-                status_var.set("⚠ Ошибка подключения. Проверь ключ.")
-                status_lbl.config(fg="#f87171")
-            else:
-                status_var.set("✓ Готово! Можно закрыть это окно.")
-                status_lbl.config(fg="#4ade80")
-        except subprocess.TimeoutExpired:
-            status_var.set("⚠ Таймаут. Попробуй ещё раз.")
+            import importlib, fetch_usage as _fu
+            importlib.reload(_fu)   # подхватить только что записанный SESSION
+            res = _fu.fetch_and_save()
+        except Exception as e:
+            status_var.set(f"⚠ {type(e).__name__}: проверь подключение")
             status_lbl.config(fg="#f87171")
+            return
+        if isinstance(res, dict) and res.get("error"):
+            status_var.set("⚠ Ключ отклонён. Проверь, что скопировал целиком.")
+            status_lbl.config(fg="#f87171")
+        else:
+            status_var.set("✓ Готово! Можно закрыть это окно.")
+            status_lbl.config(fg="#4ade80")
 
     tk.Button(root, text="  Сохранить и проверить  ",
               command=save,

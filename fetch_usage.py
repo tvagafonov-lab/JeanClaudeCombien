@@ -42,9 +42,15 @@ def _is_expired(r) -> bool:
 
 def _get_org_id(s) -> str | None:
     """Returns the cached org_id, or fetches and caches it. Returns None
-    when the sessionKey was rejected (caller surfaces `error: expired`)."""
+    when the sessionKey was rejected (caller surfaces `error: expired`).
+    A corrupt cache (partial write, missing key, manual edit) is removed
+    rather than allowed to stick forever — re-fetching from the API is
+    cheap and self-healing."""
     if ORG_CACHE.exists():
-        return json.loads(ORG_CACHE.read_text("utf-8"))["org_id"]
+        try:
+            return json.loads(ORG_CACHE.read_text("utf-8"))["org_id"]
+        except (ValueError, KeyError):
+            ORG_CACHE.unlink(missing_ok=True)
     r = s.get("https://claude.ai/api/organizations", timeout=10)
     if _is_expired(r):
         return None

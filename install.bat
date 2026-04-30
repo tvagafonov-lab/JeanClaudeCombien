@@ -1,10 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 chcp 65001 >nul 2>&1
-title Claude Monitor — Install
+title JeanClaudeCombien — Install
 
 echo.
-echo  ◆ Claude Monitor — Установка
+echo  ◆ JeanClaudeCombien — Установка
 echo  ================================
 echo.
 
@@ -89,7 +89,7 @@ python "%~dp0setup.py"
 
 echo.
 echo  ◆ Готово!
-echo    - При следующем входе в Windows Claude Monitor запустится автоматически.
+echo    - При следующем входе в Windows JeanClaudeCombien запустится автоматически.
 echo    - Запустить сейчас: дважды кликни start_monitor.bat
 echo.
 pause
