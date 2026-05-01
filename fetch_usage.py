@@ -28,16 +28,23 @@ def _get_scraper(key: str):
 
 def _is_expired(r) -> bool:
     """True if the HTTP response indicates sessionKey is no longer valid.
-    Covers both raw 401/403 and the JSON error shape Anthropic returns
-    through their Cloudflare layer with HTTP 200-looking bodies."""
-    if r.status_code in (401, 403):
-        return True
+
+    HTTP 401 is unambiguously an auth failure. 403 alone is NOT — Cloudflare
+    serves 403 for bot-challenge pages too, and a fresh cloudscraper session
+    occasionally hits one right after process restart. We only call 403
+    'expired' when the body confirms it via Anthropic's structured error
+    code; otherwise we treat it as transient and let backoff retry pick a
+    new TLS fingerprint."""
     try:
-        err = r.json().get("error", {})
-        code = (err.get("details") or {}).get("error_code", "")
-        return code == "account_session_invalid"
-    except (ValueError, AttributeError):
-        return False
+        body = r.json()
+    except ValueError:
+        body = None
+    code = ""
+    if isinstance(body, dict):
+        code = (body.get("error", {}).get("details") or {}).get("error_code", "")
+    if code == "account_session_invalid":
+        return True
+    return r.status_code == 401
 
 
 def _get_org_id(s) -> str | None:
