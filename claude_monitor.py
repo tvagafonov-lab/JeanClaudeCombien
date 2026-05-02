@@ -623,11 +623,29 @@ class JeanClaudeCombien:
                 result = fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
-            expired = isinstance(result, dict) and result.get("error") in ("expired", "no_session")
-            if expired:
+            error_kind = result.get("error") if isinstance(result, dict) else None
+            # "expired" needs two consecutive hits before we trust it: a
+            # single 403-with-account_session_invalid sometimes comes from a
+            # transient Cloudflare rewrite during fingerprint warm-up, not
+            # a real auth failure. "no_session" is unambiguous (no key
+            # file at all) so we open the dialog immediately.
+            if error_kind == "expired":
+                self._expired_streak = getattr(self, "_expired_streak", 0) + 1
+            else:
+                self._expired_streak = 0
+            confirm_expired = (error_kind == "no_session"
+                               or (error_kind == "expired" and self._expired_streak >= 2))
+            if confirm_expired:
                 self._fetch_backoff_ms = 5_000   # don't drift the network-error backoff into the auth flow
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
                 self.root.after(0, self._prompt_session_refresh)
+            elif error_kind == "expired":
+                # First expired hit — flag the header but don't open setup yet.
+                self.root.after(0, lambda: self._upd_var.set("⚠ retry"))
+                retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
+                if retry_ms <= 60_000:
+                    self.root.after(retry_ms, self._bg_fetch)
+                    self._fetch_backoff_ms = retry_ms * 3
             elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —

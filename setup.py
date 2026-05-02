@@ -100,30 +100,9 @@ def run_gui():
             return
 
         SESSION.write_text(json.dumps({"sessionKey": key}), encoding="utf-8")
-
-        # Удаляем кэш org_id — будет получен заново
-        if ORG_CACHE.exists():
-            ORG_CACHE.unlink()
-
-        status_var.set("Проверяю подключение...")
-        status_lbl.config(fg=fg_muted)
-        root.update()
-
-        # Тестовый запрос — импортим напрямую, без subprocess
-        try:
-            import importlib, fetch_usage as _fu
-            importlib.reload(_fu)   # подхватить только что записанный SESSION
-            res = _fu.fetch_and_save()
-        except Exception as e:
-            status_var.set(f"⚠ {type(e).__name__}: проверь подключение")
-            status_lbl.config(fg="#f87171")
-            return
-        if isinstance(res, dict) and res.get("error"):
-            status_var.set("⚠ Ключ отклонён. Проверь, что скопировал целиком.")
-            status_lbl.config(fg="#f87171")
-        else:
-            status_var.set("✓ Готово! Можно закрыть это окно.")
-            status_lbl.config(fg="#4ade80")
+        ORG_CACHE.unlink(missing_ok=True)
+        status_var.set("✓ Сохранено. Закрой окно — оверлей подхватит ключ.")
+        status_lbl.config(fg="#4ade80")
 
     tk.Button(root, text="  Сохранить и проверить  ",
               command=save,
