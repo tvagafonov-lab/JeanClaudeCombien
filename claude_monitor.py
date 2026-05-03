@@ -624,28 +624,31 @@ class JeanClaudeCombien:
             except Exception as e:
                 err = type(e).__name__
             error_kind = result.get("error") if isinstance(result, dict) else None
-            # "expired" needs two consecutive hits before we trust it: a
-            # single 403-with-account_session_invalid sometimes comes from a
-            # transient Cloudflare rewrite during fingerprint warm-up, not
-            # a real auth failure. "no_session" is unambiguous (no key
-            # file at all) so we open the dialog immediately.
+            # "expired" auto-opens setup only after the second tick still
+            # says expired AND those ticks are at least 60 s apart. A
+            # single 403 — or two 403s in quick succession because of an
+            # exp-backoff retry against the same Cloudflare fingerprint —
+            # is treated as transient. "no_session" (file genuinely
+            # missing) is unambiguous and opens the dialog immediately.
+            now = time.time()
             if error_kind == "expired":
-                self._expired_streak = getattr(self, "_expired_streak", 0) + 1
+                last = getattr(self, "_last_expired_ts", 0)
+                if now - last >= 60:
+                    self._expired_streak = getattr(self, "_expired_streak", 0) + 1
+                    self._last_expired_ts = now
             else:
                 self._expired_streak = 0
+                self._last_expired_ts = 0
             confirm_expired = (error_kind == "no_session"
                                or (error_kind == "expired" and self._expired_streak >= 2))
             if confirm_expired:
-                self._fetch_backoff_ms = 5_000   # don't drift the network-error backoff into the auth flow
+                self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
                 self.root.after(0, self._prompt_session_refresh)
             elif error_kind == "expired":
-                # First expired hit — flag the header but don't open setup yet.
+                # Surface in header; do NOT schedule an aggressive retry —
+                # let the 3-min periodic tick decide if it's still expired.
                 self.root.after(0, lambda: self._upd_var.set("⚠ retry"))
-                retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
-                if retry_ms <= 60_000:
-                    self.root.after(retry_ms, self._bg_fetch)
-                    self._fetch_backoff_ms = retry_ms * 3
             elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —
