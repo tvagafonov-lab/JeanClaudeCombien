@@ -668,12 +668,32 @@ class JeanClaudeCombien:
         self._upd_var.set("↻ …")
 
     def _prompt_session_refresh(self):
-        """Spawn the setup dialog when Claude returned 401/403 or the
-        session file is missing. One-at-a-time: if the previous dialog
-        is still open we do nothing and let the user finish."""
+        """Spawn the setup dialog. Hard-guarded so a runaway upstream
+        signal can't reopen the window every minute:
+          1) one process at a time (poll the previous Popen),
+          2) 10-min cooldown between successful spawns,
+          3) one final synchronous re-fetch before spawning — if the
+             API now answers OK we suppress the dialog (the upstream
+             "expired" signal was a false positive)."""
         proc = getattr(self, "_setup_proc", None)
         if proc is not None and proc.poll() is None:
             return
+        last = getattr(self, "_setup_spawn_ts", 0)
+        if time.time() - last < 600:
+            return
+        # Last-chance sanity check — runs in a thread so we don't block
+        # the Tk main loop on a slow Cloudflare handshake.
+        def verify_and_maybe_spawn():
+            try:
+                res = fetch_usage.fetch_and_save()
+                if isinstance(res, dict) and not res.get("error"):
+                    return   # API is fine; suppress the dialog entirely
+            except Exception:
+                pass         # network blip — let the dialog open
+            self.root.after(0, self._spawn_setup_now)
+        threading.Thread(target=verify_and_maybe_spawn, daemon=True).start()
+
+    def _spawn_setup_now(self):
         setup_path = Path(__file__).with_name("setup.py")
         if not setup_path.exists():
             return
@@ -682,6 +702,7 @@ class JeanClaudeCombien:
                 [sys.executable, str(setup_path)],
                 cwd=str(setup_path.parent),
             )
+            self._setup_spawn_ts = time.time()
         except OSError:
             self._setup_proc = None
 
