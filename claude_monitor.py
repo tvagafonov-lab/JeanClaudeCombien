@@ -681,16 +681,19 @@ class JeanClaudeCombien:
         last = getattr(self, "_setup_spawn_ts", 0)
         if time.time() - last < 600:
             return
-        # Last-chance sanity check — runs in a thread so we don't block
-        # the Tk main loop on a slow Cloudflare handshake.
+        # Last-chance sanity check, runs off the Tk loop. We open the
+        # dialog ONLY if this fresh fetch *explicitly* confirms an auth
+        # failure. Anything else — success, network exception, transient
+        # Cloudflare blip — silently suppresses the dialog and lets the
+        # next periodic tick try again. That makes the upstream "expired"
+        # signal advisory rather than authoritative.
         def verify_and_maybe_spawn():
             try:
                 res = fetch_usage.fetch_and_save()
-                if isinstance(res, dict) and not res.get("error"):
-                    return   # API is fine; suppress the dialog entirely
             except Exception:
-                pass         # network blip — let the dialog open
-            self.root.after(0, self._spawn_setup_now)
+                return
+            if isinstance(res, dict) and res.get("error") in ("expired", "no_session"):
+                self.root.after(0, self._spawn_setup_now)
         threading.Thread(target=verify_and_maybe_spawn, daemon=True).start()
 
     def _spawn_setup_now(self):
