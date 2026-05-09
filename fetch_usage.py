@@ -13,16 +13,40 @@ SESSION    = CLAUDE_DIR / "monitor_session.json"
 ORG_CACHE  = CLAUDE_DIR / "monitor_org.json"
 
 
+_LOG = CLAUDE_DIR / "monitor_fetch.log"
+
+
+def _log(msg: str) -> None:
+    """Append a single line to the rolling fetch log. The file is the
+    smoking-gun for diagnosing 'why did setup pop up at 01:42'."""
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # Cap at 64 KB so the log never bloats indefinitely.
+        if _LOG.exists() and _LOG.stat().st_size > 64_000:
+            tail = _LOG.read_text(encoding="utf-8", errors="ignore")[-32_000:]
+            _LOG.write_text(tail, encoding="utf-8")
+        with _LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{ts}  {msg}\n")
+    except OSError:
+        pass
+
+
 def _get_scraper(key: str):
-    """Build a *fresh* cloudscraper on every call — no module-level cache.
-    Costs ~200 ms of TLS handshake per fetch but avoids cumulative state
-    poisoning inside a long-running process (where Cloudflare can blacklist
-    a persistent fingerprint and every subsequent call silently fails)."""
+    """Build a fresh cloudscraper, then warm it up with a no-auth GET to
+    claude.ai/. Cloudflare hands out a fresh challenge token on that
+    first hit; reusing it on the API call immediately after sidesteps
+    the 'cold scraper gets challenged on auth endpoint' failure mode
+    that can return a 403 even with a valid sessionKey."""
     import cloudscraper
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
     s.cookies.set("sessionKey", key, domain="claude.ai")
+    try:
+        s.get("https://claude.ai/", timeout=10)
+    except Exception:
+        pass   # warm-up is best-effort; the real call will surface any error
     return s
 
 
@@ -68,23 +92,27 @@ def _get_org_id(s) -> str | None:
 
 def fetch_and_save() -> dict:
     if not SESSION.exists():
+        _log("no_session: session file missing")
         return {"error": "no_session"}
 
     key = json.loads(SESSION.read_text("utf-8")).get("sessionKey", "")
     if not key:
+        _log("no_session: empty sessionKey field")
         return {"error": "no_session"}
 
     s      = _get_scraper(key)
     org_id = _get_org_id(s)
     if org_id is None:
+        _log("expired: orgs endpoint reported invalid session")
         return {"error": "expired"}
 
     r = s.get(
         f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
     )
     if _is_expired(r):
-        # org_id cache may be stale too after a re-login flipped orgs.
         ORG_CACHE.unlink(missing_ok=True)
+        _log(f"expired: usage endpoint reported invalid session "
+             f"(status={r.status_code} body={r.text[:120]!r})")
         return {"error": "expired"}
     usage = r.json()
 
@@ -112,6 +140,8 @@ def fetch_and_save() -> dict:
     }
 
     CACHE_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    _log(f"ok: fh={result['fh_pct']} wd={result['wd_pct']} "
+         f"sn={result['sn_pct']} dz={result['dz_pct']}")
     return result
 
 

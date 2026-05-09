@@ -640,7 +640,7 @@ class JeanClaudeCombien:
                 self._expired_streak = 0
                 self._last_expired_ts = 0
             confirm_expired = (error_kind == "no_session"
-                               or (error_kind == "expired" and self._expired_streak >= 2))
+                               or (error_kind == "expired" and self._expired_streak >= 3))
             if confirm_expired:
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
@@ -679,7 +679,7 @@ class JeanClaudeCombien:
         if proc is not None and proc.poll() is None:
             return
         last = getattr(self, "_setup_spawn_ts", 0)
-        if time.time() - last < 600:
+        if time.time() - last < 3600:   # 1 hour between spawns
             return
         # Last-chance sanity check, runs off the Tk loop. We open the
         # dialog ONLY if this fresh fetch *explicitly* confirms an auth
