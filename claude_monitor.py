@@ -669,32 +669,57 @@ class JeanClaudeCombien:
 
     def _prompt_session_refresh(self):
         """Spawn the setup dialog. Hard-guarded so a runaway upstream
-        signal can't reopen the window every minute:
+        signal can't reopen the window:
           1) one process at a time (poll the previous Popen),
-          2) 10-min cooldown between successful spawns,
-          3) one final synchronous re-fetch before spawning — if the
-             API now answers OK we suppress the dialog (the upstream
-             "expired" signal was a false positive)."""
+          2) 1-hour cooldown between successful spawns,
+          3) cache-freshness gate — if the on-disk cache has valid
+             percentages with a fetched_at < 10 minutes old, the key
+             is definitely working; suppress the dialog.
+          4) final synchronous re-fetch before spawning — open the
+             dialog ONLY if the fetch explicitly returns
+             {'error': 'expired' | 'no_session'}."""
+        fetch_usage._log("prompt: _prompt_session_refresh called")
         proc = getattr(self, "_setup_proc", None)
         if proc is not None and proc.poll() is None:
+            fetch_usage._log("prompt: suppressed (previous dialog still open)")
             return
         last = getattr(self, "_setup_spawn_ts", 0)
-        if time.time() - last < 3600:   # 1 hour between spawns
+        if time.time() - last < 3600:
+            fetch_usage._log(f"prompt: suppressed (cooldown, {int(time.time()-last)}s since last spawn)")
             return
-        # Last-chance sanity check, runs off the Tk loop. We open the
-        # dialog ONLY if this fresh fetch *explicitly* confirms an auth
-        # failure. Anything else — success, network exception, transient
-        # Cloudflare blip — silently suppresses the dialog and lets the
-        # next periodic tick try again. That makes the upstream "expired"
-        # signal advisory rather than authoritative.
+        if self._cache_is_fresh():
+            fetch_usage._log("prompt: suppressed (cache has fresh valid data)")
+            return
+
         def verify_and_maybe_spawn():
             try:
                 res = fetch_usage.fetch_and_save()
-            except Exception:
+            except Exception as e:
+                fetch_usage._log(f"prompt: verify raised {type(e).__name__}; not spawning")
                 return
             if isinstance(res, dict) and res.get("error") in ("expired", "no_session"):
+                fetch_usage._log(f"prompt: verify confirmed {res['error']}; spawning setup")
                 self.root.after(0, self._spawn_setup_now)
+            else:
+                fetch_usage._log("prompt: verify returned OK; not spawning")
         threading.Thread(target=verify_and_maybe_spawn, daemon=True).start()
+
+    def _cache_is_fresh(self) -> bool:
+        """True if the usage cache currently has valid percentages and
+        was written within the last 10 minutes. Used as a circuit breaker
+        — if the cache is fresh-and-valid, the API is clearly working,
+        so any 'expired' signal upstream must be a false positive."""
+        try:
+            cache = json.loads(CACHE_FILE.read_text("utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(cache, dict) or "error" in cache or "fh_pct" not in cache:
+            return False
+        try:
+            fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            return False
+        return time.time() - fetched < 600
 
     def _spawn_setup_now(self):
         setup_path = Path(__file__).with_name("setup.py")
@@ -706,8 +731,10 @@ class JeanClaudeCombien:
                 cwd=str(setup_path.parent),
             )
             self._setup_spawn_ts = time.time()
-        except OSError:
+            fetch_usage._log("spawn: setup.py launched")
+        except OSError as e:
             self._setup_proc = None
+            fetch_usage._log(f"spawn: Popen failed {type(e).__name__}")
 
     # ── Tray mode ─────────────────────────────────────────────────────────────
     def _enter_tray_if_pending(self):
