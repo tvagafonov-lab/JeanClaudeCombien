@@ -642,9 +642,16 @@ class JeanClaudeCombien:
             confirm_expired = (error_kind == "no_session"
                                or (error_kind == "expired" and self._expired_streak >= 3))
             if confirm_expired:
+                # No auto-spawn. A cold-start race (network stack not up,
+                # %APPDATA% briefly unreadable, etc.) used to pop a setup
+                # dialog 5 s after login even when the on-disk sessionKey
+                # was perfectly valid. Show the warning in the header and
+                # let the user open setup manually via right-click → 🔑.
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                self.root.after(0, self._prompt_session_refresh)
+                fetch_usage._log(
+                    f"warn: confirm_expired ({error_kind}) — header set, "
+                    "auto-spawn DISABLED")
             elif error_kind == "expired":
                 # Surface in header; do NOT schedule an aggressive retry —
                 # let the 3-min periodic tick decide if it's still expired.
@@ -988,6 +995,8 @@ class JeanClaudeCombien:
                       menu=self._submenu(m, lang_items, lang, self._set_lang))
 
         m.add_separator()
+        m.add_command(label="🔑 Setup sessionKey…",
+                      command=self._spawn_setup_now)
         m.add_command(label=self._t("menu_close"), command=self.root.destroy)
         m.post(e.x_root, e.y_root)
 
