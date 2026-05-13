@@ -66,6 +66,14 @@ CLAUDE_DIR    = APPDATA / "Claude"
 TOKENS_FILE   = CLAUDE_DIR / "buddy-tokens.json"
 CACHE_FILE    = CLAUDE_DIR / "monitor_usage_cache.json"
 SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
+SPAWN_STATE   = CLAUDE_DIR / "monitor_spawn_state.json"   # persistent setup-spawn cooldown
+
+# Auto-spawn guards: every threshold below has cost real-world false-positive
+# rescues. Do not loosen without a repro.
+SPAWN_MIN_UPTIME_S      = 300        # ignore the first 5 min after monitor start
+SPAWN_MIN_CACHE_AGE_S   = 1800       # cache must be older than 30 min
+SPAWN_MIN_EXPIRED_STREAK = 5         # 5 expired ticks, ≥60 s apart ≈ 5 min wall time
+SPAWN_PERSIST_COOLDOWN_S = 6 * 3600  # 6 h between auto-spawns, survives reboot
 
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
@@ -258,6 +266,44 @@ def _pil_color(hex_str: str) -> tuple:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
 
 
+def _load_spawn_state() -> float:
+    """Return the unix timestamp of the last auto-spawn, or 0.0 if absent.
+    Persisted so the 6 h cooldown survives Windows logout/reboot — without
+    this, every login was its own brand-new 'first failure → spawn setup'."""
+    try:
+        return float(json.loads(SPAWN_STATE.read_text("utf-8")).get("last_spawn_ts", 0))
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0
+
+
+def _save_spawn_state(ts: float) -> None:
+    try:
+        SPAWN_STATE.write_text(json.dumps({"last_spawn_ts": ts}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _truncate_utf16(s: str, max_units: int = 127) -> str:
+    """Truncate `s` to at most `max_units` UTF-16 code units.
+
+    Windows `NOTIFYICONDATAW.szTip` is `WCHAR[128]` (127 chars + NUL). Python
+    `str[:127]` counts Unicode code points, so a string with several emoji
+    (`💳📅🎨` — each is a UTF-16 surrogate pair, 2 units) silently slips past
+    the limit and pystray raises `ValueError: string too long (130, maximum
+    length 128)` from inside its setup_handler thread. That exception leaves
+    the tray icon half-initialized AND can cascade into the periodic fetch
+    scheduler going dormant — observed symptom: monitor process alive,
+    overlay visible, but `monitor_fetch.log` not appended for hours."""
+    out, used = [], 0
+    for ch in s:
+        units = 2 if ord(ch) > 0xFFFF else 1  # BMP supplementary → surrogate pair
+        if used + units > max_units:
+            break
+        out.append(ch)
+        used += units
+    return "".join(out)
+
+
 def _render_single_ring(size, pct, color_rgba, track_rgba, stroke,
                         supersample=4, center_rgba=None, edge_margin=3,
                         outline_rgba=None, outline_width=1):
@@ -292,6 +338,7 @@ def _render_single_ring(size, pct, color_rgba, track_rgba, stroke,
 class JeanClaudeCombien:
     def __init__(self):
         self.cfg              = Settings()
+        self._start_time      = time.time()   # for SPAWN_MIN_UPTIME_S guard
         self.root             = tk.Tk()
         self._body            = None
         self._rows_widgets    = []
@@ -640,11 +687,18 @@ class JeanClaudeCombien:
                 self._expired_streak = 0
                 self._last_expired_ts = 0
             confirm_expired = (error_kind == "no_session"
-                               or (error_kind == "expired" and self._expired_streak >= 3))
+                               or (error_kind == "expired"
+                                   and self._expired_streak >= SPAWN_MIN_EXPIRED_STREAK))
             if confirm_expired:
+                # Always surface the warning. Whether to escalate to a setup
+                # dialog is decided by _maybe_auto_spawn_setup — it enforces
+                # the uptime / cache-age / persistent-cooldown guards that
+                # past patches kept failing to enforce. The header indicator
+                # is the cheap always-on signal.
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                self.root.after(0, self._prompt_session_refresh)
+                self.root.after(0, lambda ek=error_kind:
+                                self._maybe_auto_spawn_setup(ek))
             elif error_kind == "expired":
                 # Surface in header; do NOT schedule an aggressive retry —
                 # let the 3-min periodic tick decide if it's still expired.
@@ -666,6 +720,53 @@ class JeanClaudeCombien:
                 self.root.after(0, self._enter_tray_if_pending)
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
+
+    def _maybe_auto_spawn_setup(self, error_kind: str):
+        """Run the full guard chain before delegating to _prompt_session_refresh.
+
+        History: this is the fifth iteration. Previous patches loosened or
+        tightened single thresholds and the bug kept coming back. This
+        version requires ALL of:
+          - monitor uptime ≥ SPAWN_MIN_UPTIME_S
+              (a cold-start network race must not be enough on its own;
+               cf. the post-signin "no_session" symptom seen at +5 s).
+          - on-disk cache age ≥ SPAWN_MIN_CACHE_AGE_S
+              (if the cache is recent, the key is provably working — any
+               'expired' is a transient API/Cloudflare hiccup, not auth).
+          - SPAWN_MIN_EXPIRED_STREAK consecutive 'expired' ticks, ≥60 s
+            apart (already enforced by _expired_streak in caller for the
+            "expired" branch; trivially satisfied by "no_session").
+          - persistent cooldown via SPAWN_STATE on disk
+              (in-memory _setup_spawn_ts didn't survive reboot, so every
+               Windows login was its own cold-start race all over again).
+        """
+        now = time.time()
+        uptime = now - self._start_time
+        if uptime < SPAWN_MIN_UPTIME_S:
+            fetch_usage._log(
+                f"auto-spawn: blocked uptime={uptime:.0f}s "
+                f"<{SPAWN_MIN_UPTIME_S}s (cold-start race window)")
+            return
+        try:
+            cache_age = now - CACHE_FILE.stat().st_mtime
+        except OSError:
+            cache_age = float("inf")
+        if cache_age < SPAWN_MIN_CACHE_AGE_S:
+            fetch_usage._log(
+                f"auto-spawn: blocked cache_age={cache_age:.0f}s "
+                f"<{SPAWN_MIN_CACHE_AGE_S}s (cache still fresh — key works)")
+            return
+        last_spawn = _load_spawn_state()
+        cooldown_left = SPAWN_PERSIST_COOLDOWN_S - (now - last_spawn)
+        if cooldown_left > 0:
+            fetch_usage._log(
+                f"auto-spawn: blocked cooldown_left={cooldown_left:.0f}s "
+                f"({SPAWN_PERSIST_COOLDOWN_S}s persistent window)")
+            return
+        fetch_usage._log(
+            f"auto-spawn: all guards passed (error_kind={error_kind} "
+            f"uptime={uptime:.0f}s cache_age={cache_age:.0f}s) → prompt")
+        self._prompt_session_refresh()
 
     def _prompt_session_refresh(self):
         """Spawn the setup dialog. Hard-guarded so a runaway upstream
@@ -731,6 +832,7 @@ class JeanClaudeCombien:
                 cwd=str(setup_path.parent),
             )
             self._setup_spawn_ts = time.time()
+            _save_spawn_state(self._setup_spawn_ts)   # 6 h persistent cooldown
             fetch_usage._log("spawn: setup.py launched")
         except OSError as e:
             self._setup_proc = None
@@ -844,7 +946,7 @@ class JeanClaudeCombien:
                     pct = 0.0
                 rst = fmt_reset(cache.get(key_rst), lang, win_s, now)
                 lines.append(f"{icon} {name}: {pct:.0f}%   {rst}")
-        return "\n".join(lines)[:127]
+        return _truncate_utf16("\n".join(lines))
 
     def _show_hover_card(self):
         self._hide_hover_card()
@@ -988,6 +1090,8 @@ class JeanClaudeCombien:
                       menu=self._submenu(m, lang_items, lang, self._set_lang))
 
         m.add_separator()
+        m.add_command(label="🔑 Setup sessionKey…",
+                      command=self._spawn_setup_now)
         m.add_command(label=self._t("menu_close"), command=self.root.destroy)
         m.post(e.x_root, e.y_root)
 

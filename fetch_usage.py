@@ -20,7 +20,6 @@ def _log(msg: str) -> None:
     """Append a single line to the rolling fetch log. The file is the
     smoking-gun for diagnosing 'why did setup pop up at 01:42'."""
     try:
-        from datetime import datetime, timezone
         ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         # Cap at 64 KB so the log never bloats indefinitely.
         if _LOG.exists() and _LOG.stat().st_size > 64_000:
@@ -28,7 +27,8 @@ def _log(msg: str) -> None:
             _LOG.write_text(tail, encoding="utf-8")
         with _LOG.open("a", encoding="utf-8") as f:
             f.write(f"{ts}  {msg}\n")
-    except OSError:
+            f.flush()
+    except Exception:
         pass
 
 
