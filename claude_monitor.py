@@ -15,6 +15,27 @@ from datetime import datetime, timedelta, timezone
 import i18n
 import fetch_usage
 
+# ── Log redirection (must run BEFORE tk.Tk() and any thread start) ────────────
+# pythonw.exe sends stdout/stderr to NUL by default. That swallows every
+# uncaught exception inside `_bg_fetch`'s worker thread, every tk
+# `report_callback_exception`, every traceback from a third-party library
+# (cloudscraper, pystray, requests, urllib3). Symptom we keep hitting:
+# process alive, overlay visible, `monitor_fetch.log` not growing for
+# hours, and no clue why. Redirect both streams to files under
+# %APPDATA%\Claude so the next scheduler-zombie incident is diagnosable
+# without manually re-running the script under python.exe.
+# Mode 'w' truncates per launch — we want THIS run's evidence, not a
+# rolling history that buries the relevant trace.
+try:
+    _LOG_DIR = Path(os.environ.get("APPDATA", "")) / "Claude"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    sys.stdout = open(_LOG_DIR / "monitor_stdout.log", "w",
+                      encoding="utf-8", buffering=1)
+    sys.stderr = open(_LOG_DIR / "monitor_stderr.log", "w",
+                      encoding="utf-8", buffering=1)
+except Exception:
+    pass  # best-effort; staying on /dev/null is no worse than today
+
 # Distinct AppUserModelID so Win11 shell treats this pythonw.exe instance
 # as its own application (separate from any sibling overlay like CHB).
 try:
@@ -340,6 +361,12 @@ class JeanClaudeCombien:
         self.cfg              = Settings()
         self._start_time      = time.time()   # for SPAWN_MIN_UPTIME_S guard
         self.root             = tk.Tk()
+        # Mirror Tk-mainloop callback exceptions into monitor_fetch.log.
+        # Without this they only reach sys.stderr — which under pythonw.exe
+        # is /dev/null. Even after the startup redirect, having them in the
+        # same triage file as `ok:`/`err:` ticks lets us spot the moment
+        # scheduler-zombie started by glancing at one log.
+        self.root.report_callback_exception = self._tk_exc
         self._body            = None
         self._rows_widgets    = []
         self._known_mtime     = 0.0
@@ -360,6 +387,28 @@ class JeanClaudeCombien:
         self._schedule_bg_fetch()
         if self._tray_wanted:
             self.root.after(5_000, self._enter_tray_if_pending)
+
+    def _tk_exc(self, exc, val, tb):
+        """Surface uncaught exceptions from Tk-mainloop callbacks.
+
+        Tk routes errors raised by `root.after()` callbacks (including the
+        UI-thread half of `_bg_fetch`) through `report_callback_exception`.
+        Default implementation prints to sys.stderr — which is /dev/null
+        under pythonw.exe. We mirror the formatted traceback into
+        monitor_fetch.log so triage stays in one file, and also write it
+        to stderr (now redirected by the startup block at the top of the
+        module) for full multiline detail."""
+        import traceback
+        msg = "".join(traceback.format_exception(exc, val, tb))[:1200]
+        try:
+            fetch_usage._log("tk-exc: " + msg.replace("\n", " | "))
+        except Exception:
+            pass
+        try:
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     def _t(self, key: str, **kwargs) -> str:
         return i18n.get(self.cfg["lang"], key, **kwargs)
@@ -670,6 +719,17 @@ class JeanClaudeCombien:
                 result = fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
+                # Without this line a recurring failure (network race
+                # right after resume-from-sleep, cloudscraper rebuild,
+                # ssl handshake timeout) was invisible — `monitor_fetch.log`
+                # simply stopped growing while the process stayed alive
+                # and the user saw "⚠ {ClassName}" only in the overlay
+                # header. Now every silent skip lands in the same file
+                # we already tail for triage.
+                try:
+                    fetch_usage._log(f"err: {err}: {str(e)[:160]}")
+                except Exception:
+                    pass
             error_kind = result.get("error") if isinstance(result, dict) else None
             # "expired" auto-opens setup only after the second tick still
             # says expired AND those ticks are at least 60 s apart. A
