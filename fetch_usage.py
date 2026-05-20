@@ -18,13 +18,23 @@ _LOG = CLAUDE_DIR / "monitor_fetch.log"
 
 def _log(msg: str) -> None:
     """Append a single line to the rolling fetch log. The file is the
-    smoking-gun for diagnosing 'why did setup pop up at 01:42'."""
+    smoking-gun for diagnosing 'why did setup pop up at 01:42'.
+
+    Rotation uses an atomic .tmp + os.replace so a Tk-thread that grabs
+    the handle mid-rotation cannot observe a half-written file — the
+    2026-05-20 zombie incident had a missing trail (spawn_state.json
+    updated at 14:29:25 but no auto-spawn:/prompt:/spawn: lines in the
+    log preceding it), consistent with a write_text() that partially
+    truncated while another thread was opening the same path.
+    """
     try:
         ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         # Cap at 64 KB so the log never bloats indefinitely.
         if _LOG.exists() and _LOG.stat().st_size > 64_000:
             tail = _LOG.read_text(encoding="utf-8", errors="ignore")[-32_000:]
-            _LOG.write_text(tail, encoding="utf-8")
+            tmp  = _LOG.with_suffix(_LOG.suffix + ".tmp")
+            tmp.write_text(tail, encoding="utf-8")
+            os.replace(tmp, _LOG)
         with _LOG.open("a", encoding="utf-8") as f:
             f.write(f"{ts}  {msg}\n")
             f.flush()

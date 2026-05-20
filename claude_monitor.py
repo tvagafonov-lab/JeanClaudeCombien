@@ -96,6 +96,19 @@ SPAWN_MIN_CACHE_AGE_S   = 1800       # cache must be older than 30 min
 SPAWN_MIN_EXPIRED_STREAK = 5         # 5 expired ticks, ≥60 s apart ≈ 5 min wall time
 SPAWN_PERSIST_COOLDOWN_S = 6 * 3600  # 6 h between auto-spawns, survives reboot
 
+# Wake-from-hibernate guard: after a >5 min gap between _bg_fetch ticks the
+# OS *itself* paused us (deep sleep, lid closed, USB-C standby). The four
+# guards above were tuned for cold-start race, not for resume — at wake the
+# cache is "old" by definition (whatever it was before sleep + sleep
+# duration), uptime is meaningless (Windows reports process StartTime as
+# the resume instant on patched machines), and the first post-wake fetch
+# often hits a transient network failure before the stack is fully up.
+# When we detect that pattern, suppress auto-spawn entirely for a grace
+# window so a single transient failure cannot trip the dialog; a real
+# expired key will still get caught when the streak builds naturally.
+WAKE_DETECT_GAP_S = 300              # >5 min between ticks → suspect wake
+WAKE_GRACE_S      = 600              # 10 min hard auto-spawn block after wake
+
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
     "compact":        False,
@@ -360,6 +373,12 @@ class JeanClaudeCombien:
     def __init__(self):
         self.cfg              = Settings()
         self._start_time      = time.time()   # for SPAWN_MIN_UPTIME_S guard
+        # Wake-from-hibernate detector state. _last_tick_ts is wall-clock of
+        # the previous _bg_fetch entry; a >WAKE_DETECT_GAP_S delta triggers
+        # the grace window written into _post_wake_grace_until and checked
+        # by _maybe_auto_spawn_setup.
+        self._last_tick_ts          = self._start_time
+        self._post_wake_grace_until = 0.0
         self.root             = tk.Tk()
         # Mirror Tk-mainloop callback exceptions into monitor_fetch.log.
         # Without this they only reach sys.stderr — which under pythonw.exe
@@ -712,6 +731,23 @@ class JeanClaudeCombien:
 
     # ── Background fetch ──────────────────────────────────────────────────────
     def _bg_fetch(self):
+        # Wake-from-hibernate detector: compare wall-clock gap to expected
+        # tick cadence. The OS can pause us silently — no exception, no log
+        # line, the thread just doesn't run for hours (lid closed, deep
+        # standby, Connected Standby on Win11). On the *next* call we see
+        # a huge gap and open a grace window in _post_wake_grace_until so
+        # a single post-wake fetch failure does not trip auto-spawn.
+        # Sized at >5 min because the normal cadence is 60–180 s and a
+        # full Cloudflare retry chain still finishes well under 300 s.
+        now_check = time.time()
+        gap = now_check - getattr(self, "_last_tick_ts", now_check)
+        if gap > WAKE_DETECT_GAP_S:
+            self._post_wake_grace_until = now_check + WAKE_GRACE_S
+            fetch_usage._log(
+                f"wake-detected: gap={gap:.0f}s "
+                f">{WAKE_DETECT_GAP_S}s; spawn-guard grace {WAKE_GRACE_S}s")
+        self._last_tick_ts = now_check
+
         def run():
             err = None
             result = None
@@ -784,9 +820,14 @@ class JeanClaudeCombien:
     def _maybe_auto_spawn_setup(self, error_kind: str):
         """Run the full guard chain before delegating to _prompt_session_refresh.
 
-        History: this is the fifth iteration. Previous patches loosened or
+        History: this is the sixth iteration. Previous patches loosened or
         tightened single thresholds and the bug kept coming back. This
         version requires ALL of:
+          - no recent wake-from-hibernate (within WAKE_GRACE_S)
+              (sixth iteration: an overnight standby trivially satisfies
+               uptime + cache_age + cooldown the instant we resume; one
+               flaky post-wake fetch then tripped the dialog. Hard-block
+               for a grace window so streak has time to build naturally.)
           - monitor uptime ≥ SPAWN_MIN_UPTIME_S
               (a cold-start network race must not be enough on its own;
                cf. the post-signin "no_session" symptom seen at +5 s).
@@ -801,6 +842,13 @@ class JeanClaudeCombien:
                Windows login was its own cold-start race all over again).
         """
         now = time.time()
+        wake_until = getattr(self, "_post_wake_grace_until", 0.0)
+        if now < wake_until:
+            fetch_usage._log(
+                f"auto-spawn: blocked post-wake-grace "
+                f"remaining={wake_until - now:.0f}s "
+                f"({WAKE_GRACE_S}s window after detected resume)")
+            return
         uptime = now - self._start_time
         if uptime < SPAWN_MIN_UPTIME_S:
             fetch_usage._log(
