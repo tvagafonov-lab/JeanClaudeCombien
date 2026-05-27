@@ -2,7 +2,7 @@
 Получает данные с claude.ai через cloudscraper + sessionKey.
 Сохраняет в monitor_usage_cache.json.
 """
-import json, os
+import json, os, sys
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -18,16 +18,36 @@ _LOG = CLAUDE_DIR / "monitor_fetch.log"
 
 def _log(msg: str) -> None:
     """Append a single line to the rolling fetch log. The file is the
-    smoking-gun for diagnosing 'why did setup pop up at 01:42'."""
+    smoking-gun for diagnosing 'why did setup pop up at 01:42'.
+
+    Two robustness fixes against past zombie incidents:
+    * Rotation uses .tmp + os.replace so a concurrent reader can never
+      see a half-written file (atomic on Windows for same-directory).
+    * On any open/write failure we fall through to sys.stderr (which
+      claude_monitor.py's startup block redirects into monitor_stderr.log).
+      The 2026-05-27 incident left zero trail in monitor_fetch.log
+      because something — most likely a zombie handle — blocked our
+      'a'-mode opens. Stderr is a separate descriptor and survives.
+    """
+    ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts}  {msg}\n"
     try:
-        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         # Cap at 64 KB so the log never bloats indefinitely.
         if _LOG.exists() and _LOG.stat().st_size > 64_000:
             tail = _LOG.read_text(encoding="utf-8", errors="ignore")[-32_000:]
-            _LOG.write_text(tail, encoding="utf-8")
+            tmp  = _LOG.with_suffix(_LOG.suffix + ".tmp")
+            tmp.write_text(tail, encoding="utf-8")
+            os.replace(tmp, _LOG)
         with _LOG.open("a", encoding="utf-8") as f:
-            f.write(f"{ts}  {msg}\n")
+            f.write(line)
             f.flush()
+        return
+    except Exception as e:
+        primary_err = type(e).__name__
+    # Fallback path — keep visibility even when the primary log is dead.
+    try:
+        sys.stderr.write(f"[_log-fallback {primary_err}] {line}")
+        sys.stderr.flush()
     except Exception:
         pass
 

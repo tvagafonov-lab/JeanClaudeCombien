@@ -87,14 +87,17 @@ CLAUDE_DIR    = APPDATA / "Claude"
 TOKENS_FILE   = CLAUDE_DIR / "buddy-tokens.json"
 CACHE_FILE    = CLAUDE_DIR / "monitor_usage_cache.json"
 SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
-SPAWN_STATE   = CLAUDE_DIR / "monitor_spawn_state.json"   # persistent setup-spawn cooldown
-
-# Auto-spawn guards: every threshold below has cost real-world false-positive
-# rescues. Do not loosen without a repro.
-SPAWN_MIN_UPTIME_S      = 300        # ignore the first 5 min after monitor start
-SPAWN_MIN_CACHE_AGE_S   = 1800       # cache must be older than 30 min
-SPAWN_MIN_EXPIRED_STREAK = 5         # 5 expired ticks, ≥60 s apart ≈ 5 min wall time
-SPAWN_PERSIST_COOLDOWN_S = 6 * 3600  # 6 h between auto-spawns, survives reboot
+# Scheduler watchdog: independent daemon-thread that respawns the process
+# if _bg_fetch hasn't fired a heartbeat for this long. The four-incident
+# series (2026-05-13…2026-05-27) made it clear that the real fault isn't
+# auth false-positives but scheduler-zombie — root.after callbacks stop
+# firing after wake/standby/cold-boot and no in-process logic can detect
+# it from a thread that has already been silenced. Watchdog runs in its
+# own daemon-thread (independent of tk-mainloop), checks the heartbeat
+# every 60 s, and after >WATCHDOG_FATAL_S of silence Popens a fresh self
+# and os._exit(2). Sized as 3× the 180 s fetch cadence with one tick of
+# slack — anything past three lost ticks is unambiguously dead.
+WATCHDOG_FATAL_S = 600
 
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
@@ -287,23 +290,6 @@ def _pil_color(hex_str: str) -> tuple:
     return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
 
 
-def _load_spawn_state() -> float:
-    """Return the unix timestamp of the last auto-spawn, or 0.0 if absent.
-    Persisted so the 6 h cooldown survives Windows logout/reboot — without
-    this, every login was its own brand-new 'first failure → spawn setup'."""
-    try:
-        return float(json.loads(SPAWN_STATE.read_text("utf-8")).get("last_spawn_ts", 0))
-    except (OSError, ValueError, KeyError, TypeError):
-        return 0.0
-
-
-def _save_spawn_state(ts: float) -> None:
-    try:
-        SPAWN_STATE.write_text(json.dumps({"last_spawn_ts": ts}), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def _truncate_utf16(s: str, max_units: int = 127) -> str:
     """Truncate `s` to at most `max_units` UTF-16 code units.
 
@@ -359,7 +345,10 @@ def _render_single_ring(size, pct, color_rgba, track_rgba, stroke,
 class JeanClaudeCombien:
     def __init__(self):
         self.cfg              = Settings()
-        self._start_time      = time.time()   # for SPAWN_MIN_UPTIME_S guard
+        self._start_time      = time.time()
+        # Heartbeat updated on every _bg_fetch entry. Read by the watchdog
+        # daemon-thread; a stale value means the scheduler died.
+        self._last_tick_ts    = self._start_time
         self.root             = tk.Tk()
         # Mirror Tk-mainloop callback exceptions into monitor_fetch.log.
         # Without this they only reach sys.stderr — which under pythonw.exe
@@ -385,6 +374,11 @@ class JeanClaudeCombien:
         self._fit_height()
         self._refresh_ui()
         self._schedule_bg_fetch()
+        # Independent daemon-thread that respawns the process if the
+        # tk-mainloop-driven scheduler stops ticking. Lives outside tk
+        # so it survives wake/standby races that silence root.after.
+        threading.Thread(target=self._scheduler_watchdog,
+                         name="scheduler-watchdog", daemon=True).start()
         if self._tray_wanted:
             self.root.after(5_000, self._enter_tray_if_pending)
 
@@ -712,6 +706,11 @@ class JeanClaudeCombien:
 
     # ── Background fetch ──────────────────────────────────────────────────────
     def _bg_fetch(self):
+        # Heartbeat for the watchdog. Set on the main thread before the
+        # worker is dispatched so a thread-creation failure still bumps it
+        # (the watchdog only cares whether _bg_fetch was entered at all).
+        self._last_tick_ts = time.time()
+
         def run():
             err = None
             result = None
@@ -719,50 +718,29 @@ class JeanClaudeCombien:
                 result = fetch_usage.fetch_and_save()
             except Exception as e:
                 err = type(e).__name__
-                # Without this line a recurring failure (network race
-                # right after resume-from-sleep, cloudscraper rebuild,
-                # ssl handshake timeout) was invisible — `monitor_fetch.log`
-                # simply stopped growing while the process stayed alive
-                # and the user saw "⚠ {ClassName}" only in the overlay
-                # header. Now every silent skip lands in the same file
-                # we already tail for triage.
+                # A silenced exception here used to make monitor_fetch.log
+                # stop growing while the process stayed alive. Now every
+                # raised failure surfaces in the same triage file.
                 try:
                     fetch_usage._log(f"err: {err}: {str(e)[:160]}")
                 except Exception:
                     pass
             error_kind = result.get("error") if isinstance(result, dict) else None
-            # "expired" auto-opens setup only after the second tick still
-            # says expired AND those ticks are at least 60 s apart. A
-            # single 403 — or two 403s in quick succession because of an
-            # exp-backoff retry against the same Cloudflare fingerprint —
-            # is treated as transient. "no_session" (file genuinely
-            # missing) is unambiguous and opens the dialog immediately.
-            now = time.time()
-            if error_kind == "expired":
-                last = getattr(self, "_last_expired_ts", 0)
-                if now - last >= 60:
-                    self._expired_streak = getattr(self, "_expired_streak", 0) + 1
-                    self._last_expired_ts = now
-            else:
-                self._expired_streak = 0
-                self._last_expired_ts = 0
-            confirm_expired = (error_kind == "no_session"
-                               or (error_kind == "expired"
-                                   and self._expired_streak >= SPAWN_MIN_EXPIRED_STREAK))
-            if confirm_expired:
-                # Always surface the warning. Whether to escalate to a setup
-                # dialog is decided by _maybe_auto_spawn_setup — it enforces
-                # the uptime / cache-age / persistent-cooldown guards that
-                # past patches kept failing to enforce. The header indicator
-                # is the cheap always-on signal.
+            if error_kind in ("expired", "no_session"):
+                # Restored to the pre-v1.2.0 path: when fetch_and_save
+                # reports auth failure, surface the warning and let the
+                # final-verify guard inside _prompt_session_refresh decide
+                # whether to actually open setup.py. The streak / uptime /
+                # cache_age / persistent-cooldown chain that wrapped this
+                # decision through May 2026 was meant to suppress
+                # false-positives on Cloudflare 403 — but those are
+                # already filtered out in fetch_usage._is_expired, so the
+                # extra guards only delayed legitimate prompts and (when
+                # the scheduler went zombie) failed open. Net: simpler
+                # and more correct.
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                self.root.after(0, lambda ek=error_kind:
-                                self._maybe_auto_spawn_setup(ek))
-            elif error_kind == "expired":
-                # Surface in header; do NOT schedule an aggressive retry —
-                # let the 3-min periodic tick decide if it's still expired.
-                self.root.after(0, lambda: self._upd_var.set("⚠ retry"))
+                self.root.after(0, self._prompt_session_refresh)
             elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —
@@ -781,72 +759,27 @@ class JeanClaudeCombien:
         threading.Thread(target=run, daemon=True).start()
         self._upd_var.set("↻ …")
 
-    def _maybe_auto_spawn_setup(self, error_kind: str):
-        """Run the full guard chain before delegating to _prompt_session_refresh.
-
-        History: this is the fifth iteration. Previous patches loosened or
-        tightened single thresholds and the bug kept coming back. This
-        version requires ALL of:
-          - monitor uptime ≥ SPAWN_MIN_UPTIME_S
-              (a cold-start network race must not be enough on its own;
-               cf. the post-signin "no_session" symptom seen at +5 s).
-          - on-disk cache age ≥ SPAWN_MIN_CACHE_AGE_S
-              (if the cache is recent, the key is provably working — any
-               'expired' is a transient API/Cloudflare hiccup, not auth).
-          - SPAWN_MIN_EXPIRED_STREAK consecutive 'expired' ticks, ≥60 s
-            apart (already enforced by _expired_streak in caller for the
-            "expired" branch; trivially satisfied by "no_session").
-          - persistent cooldown via SPAWN_STATE on disk
-              (in-memory _setup_spawn_ts didn't survive reboot, so every
-               Windows login was its own cold-start race all over again).
-        """
-        now = time.time()
-        uptime = now - self._start_time
-        if uptime < SPAWN_MIN_UPTIME_S:
-            fetch_usage._log(
-                f"auto-spawn: blocked uptime={uptime:.0f}s "
-                f"<{SPAWN_MIN_UPTIME_S}s (cold-start race window)")
-            return
-        try:
-            cache_age = now - CACHE_FILE.stat().st_mtime
-        except OSError:
-            cache_age = float("inf")
-        if cache_age < SPAWN_MIN_CACHE_AGE_S:
-            fetch_usage._log(
-                f"auto-spawn: blocked cache_age={cache_age:.0f}s "
-                f"<{SPAWN_MIN_CACHE_AGE_S}s (cache still fresh — key works)")
-            return
-        last_spawn = _load_spawn_state()
-        cooldown_left = SPAWN_PERSIST_COOLDOWN_S - (now - last_spawn)
-        if cooldown_left > 0:
-            fetch_usage._log(
-                f"auto-spawn: blocked cooldown_left={cooldown_left:.0f}s "
-                f"({SPAWN_PERSIST_COOLDOWN_S}s persistent window)")
-            return
-        fetch_usage._log(
-            f"auto-spawn: all guards passed (error_kind={error_kind} "
-            f"uptime={uptime:.0f}s cache_age={cache_age:.0f}s) → prompt")
-        self._prompt_session_refresh()
-
     def _prompt_session_refresh(self):
-        """Spawn the setup dialog. Hard-guarded so a runaway upstream
-        signal can't reopen the window:
-          1) one process at a time (poll the previous Popen),
-          2) 1-hour cooldown between successful spawns,
-          3) cache-freshness gate — if the on-disk cache has valid
-             percentages with a fetched_at < 10 minutes old, the key
-             is definitely working; suppress the dialog.
-          4) final synchronous re-fetch before spawning — open the
-             dialog ONLY if the fetch explicitly returns
-             {'error': 'expired' | 'no_session'}."""
+        """Open the setup dialog when fetch_usage reports auth failure.
+
+        Three guards, in order:
+          1) one Popen at a time (poll the previous);
+          2) cache-freshness short-circuit — if the on-disk cache was
+             written by a successful fetch within the last 5 min, the
+             key is provably working and this 'expired' signal is a
+             transient blip;
+          3) final synchronous re-fetch — open the dialog ONLY if the
+             verification call still returns expired/no_session.
+
+        Deliberately NO cooldown / streak / uptime / persistent state.
+        Those were retrofitted to suppress Cloudflare-403 false-positives
+        which fetch_usage._is_expired already filters out — but they also
+        failed open whenever the scheduler went zombie and cache_age grew
+        on its own without help from real auth failures."""
         fetch_usage._log("prompt: _prompt_session_refresh called")
         proc = getattr(self, "_setup_proc", None)
         if proc is not None and proc.poll() is None:
             fetch_usage._log("prompt: suppressed (previous dialog still open)")
-            return
-        last = getattr(self, "_setup_spawn_ts", 0)
-        if time.time() - last < 3600:
-            fetch_usage._log(f"prompt: suppressed (cooldown, {int(time.time()-last)}s since last spawn)")
             return
         if self._cache_is_fresh():
             fetch_usage._log("prompt: suppressed (cache has fresh valid data)")
@@ -856,10 +789,12 @@ class JeanClaudeCombien:
             try:
                 res = fetch_usage.fetch_and_save()
             except Exception as e:
-                fetch_usage._log(f"prompt: verify raised {type(e).__name__}; not spawning")
+                fetch_usage._log(
+                    f"prompt: verify raised {type(e).__name__}; not spawning")
                 return
             if isinstance(res, dict) and res.get("error") in ("expired", "no_session"):
-                fetch_usage._log(f"prompt: verify confirmed {res['error']}; spawning setup")
+                fetch_usage._log(
+                    f"prompt: verify confirmed {res['error']}; spawning setup")
                 self.root.after(0, self._spawn_setup_now)
             else:
                 fetch_usage._log("prompt: verify returned OK; not spawning")
@@ -867,9 +802,9 @@ class JeanClaudeCombien:
 
     def _cache_is_fresh(self) -> bool:
         """True if the usage cache currently has valid percentages and
-        was written within the last 10 minutes. Used as a circuit breaker
-        — if the cache is fresh-and-valid, the API is clearly working,
-        so any 'expired' signal upstream must be a false positive."""
+        was written within the last 5 minutes. Tightened from 10 → 5 min:
+        if we haven't heard a fresh 'ok:' in 5 min, the scheduler is
+        suspect anyway and the watchdog will respawn us shortly."""
         try:
             cache = json.loads(CACHE_FILE.read_text("utf-8"))
         except (OSError, ValueError):
@@ -880,7 +815,7 @@ class JeanClaudeCombien:
             fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
         except (KeyError, ValueError, TypeError):
             return False
-        return time.time() - fetched < 600
+        return time.time() - fetched < 300
 
     def _spawn_setup_now(self):
         setup_path = Path(__file__).with_name("setup.py")
@@ -891,12 +826,45 @@ class JeanClaudeCombien:
                 [sys.executable, str(setup_path)],
                 cwd=str(setup_path.parent),
             )
-            self._setup_spawn_ts = time.time()
-            _save_spawn_state(self._setup_spawn_ts)   # 6 h persistent cooldown
             fetch_usage._log("spawn: setup.py launched")
         except OSError as e:
             self._setup_proc = None
             fetch_usage._log(f"spawn: Popen failed {type(e).__name__}")
+
+    def _scheduler_watchdog(self):
+        """Daemon-thread heartbeat monitor. If _bg_fetch hasn't ticked
+        for >WATCHDOG_FATAL_S the scheduler is dead: tk-mainloop hung,
+        root.after callbacks silenced by wake/standby, or the periodic
+        timer chain broke mid-run. We can't reliably resurrect it from
+        inside the same interpreter — Popen a fresh process and exit.
+
+        Runs in its own thread so it doesn't depend on the very loop
+        it's supposed to monitor. Sleeps in 60 s slices. Catches all
+        exceptions so a fluke (file permissions, transient os._exit
+        failure) never silences the watchdog itself."""
+        while True:
+            try:
+                time.sleep(60)
+                stale = time.time() - getattr(self, "_last_tick_ts", self._start_time)
+                if stale > WATCHDOG_FATAL_S:
+                    try:
+                        fetch_usage._log(
+                            f"watchdog: scheduler stale for {stale:.0f}s "
+                            f">{WATCHDOG_FATAL_S}s; respawning self and exiting")
+                    except Exception:
+                        pass
+                    try:
+                        subprocess.Popen(
+                            [sys.executable, __file__],
+                            cwd=str(Path(__file__).parent),
+                        )
+                    except Exception:
+                        pass
+                    os._exit(2)
+            except Exception:
+                # Never crash the watchdog on a transient OS hiccup —
+                # the next loop iteration retries cleanly.
+                pass
 
     # ── Tray mode ─────────────────────────────────────────────────────────────
     def _enter_tray_if_pending(self):
@@ -1091,21 +1059,32 @@ class JeanClaudeCombien:
         self.root.after(5_000, self._watch_tokens)
 
     def _schedule_bg_fetch(self):
-        """Initial fetch on startup + periodic fallback + file watcher."""
+        """Wire up the initial fetch, the file watcher, and the periodic
+        re-fetch timer. Called once from __init__."""
         try:
             self._known_mtime = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
         except Exception:
             self._known_mtime = 0.0
         self._last_fetch_time = time.time()
-        # Small delay on the *first* fetch after startup so the Windows
-        # network stack has time to come up — the most common cause of
-        # first-fetch failure after sign-in / unlock.
-        delay = 0 if getattr(self, "_first_fetch_done", False) else 3_000
-        self._first_fetch_done = True
-        self.root.after(delay, self._bg_fetch)
+        # Small delay on the very first fetch so the Windows network stack
+        # has time to come up after sign-in / unlock.
+        self.root.after(3_000, self._bg_fetch)
         self.root.after(5_000, self._watch_tokens)
-        # Fallback: re-fetch every 3 min regardless (browser use, session refresh)
-        self.root.after(REFETCH_INTERVAL_MS, self._schedule_bg_fetch)
+        # Periodic re-fetch. Rearm-before-fire so a raised exception in
+        # _bg_fetch can't break the chain — earlier versions chained the
+        # next tick at the *end* of the function, which meant a single
+        # lost callback (wake/standby/zombie) silenced the scheduler
+        # forever. The watchdog still backstops genuine hangs.
+        self.root.after(REFETCH_INTERVAL_MS, self._periodic_bg_fetch)
+
+    def _periodic_bg_fetch(self):
+        """Self-rearming periodic tick. Rearms before firing so a single
+        callback failure cannot break the chain."""
+        self.root.after(REFETCH_INTERVAL_MS, self._periodic_bg_fetch)
+        try:
+            self._bg_fetch()
+        except Exception:
+            pass
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e): self._ox, self._oy = e.x, e.y
