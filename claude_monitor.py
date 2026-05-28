@@ -727,20 +727,37 @@ class JeanClaudeCombien:
                     pass
             error_kind = result.get("error") if isinstance(result, dict) else None
             if error_kind in ("expired", "no_session"):
-                # Restored to the pre-v1.2.0 path: when fetch_and_save
-                # reports auth failure, surface the warning and let the
-                # final-verify guard inside _prompt_session_refresh decide
-                # whether to actually open setup.py. The streak / uptime /
-                # cache_age / persistent-cooldown chain that wrapped this
-                # decision through May 2026 was meant to suppress
-                # false-positives on Cloudflare 403 — but those are
-                # already filtered out in fetch_usage._is_expired, so the
-                # extra guards only delayed legitimate prompts and (when
-                # the scheduler went zombie) failed open. Net: simpler
-                # and more correct.
+                # PR #4 restored the simple "expired -> _prompt_session_refresh"
+                # path because the Cloudflare-403 false-positives the old
+                # streak/cache_age guards were chasing had already been
+                # filtered out in fetch_usage._is_expired. That left one
+                # remaining race: a process that wakes (or gets respawned
+                # by the watchdog) right when the OS network stack is
+                # still mid-handshake can see a single real 401 from
+                # Anthropic before the connection settles. Pristine path
+                # treated that as expired and opened setup.py.
+                #
+                # One-tick retry absorbs that case without bringing back
+                # the old guard chain: the FIRST expired tick just sets
+                # the header and reschedules _bg_fetch in 30 s. A truly
+                # expired key stays expired across the gap and the SECOND
+                # consecutive tick escalates to _prompt_session_refresh
+                # (which still does its own verify before the dialog).
+                # Sized at 1 retry (not 5 like the old streak) because
+                # _is_expired is strict — a confirmed 401 thirty seconds
+                # apart is real expiry.
+                expired_streak = getattr(self, "_expired_streak", 0) + 1
+                self._expired_streak = expired_streak
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                self.root.after(0, self._prompt_session_refresh)
+                if expired_streak >= 2:
+                    fetch_usage._log(
+                        f"expired-tick {expired_streak} ({error_kind}); escalating to _prompt_session_refresh")
+                    self.root.after(0, self._prompt_session_refresh)
+                else:
+                    fetch_usage._log(
+                        f"expired-tick {expired_streak} ({error_kind}); retry in 30 s before escalating")
+                    self.root.after(30_000, self._bg_fetch)
             elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —
@@ -751,6 +768,8 @@ class JeanClaudeCombien:
                     self.root.after(retry_ms, self._bg_fetch)
                     self._fetch_backoff_ms = retry_ms * 3
             else:
+                # Successful fetch — reset the cold-network retry counter.
+                self._expired_streak = 0
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, self._refresh_ui)
                 # Enter tray only once the cache is populated so the icon's
