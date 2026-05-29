@@ -99,6 +99,25 @@ SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
 # slack — anything past three lost ticks is unambiguously dead.
 WATCHDOG_FATAL_S = 600
 
+
+try:
+    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_uint64
+except Exception:
+    pass
+
+
+def _system_uptime_s() -> float:
+    """Seconds since the last Windows boot, via GetTickCount64.
+    Returns 0.0 if the API is unavailable so callers treat the system
+    as 'long up' (i.e. the cold-boot suppression window is closed).
+    restype is pinned to c_uint64 at import to avoid 32-bit truncation
+    on machines that have been up for >49 days."""
+    try:
+        return ctypes.windll.kernel32.GetTickCount64() / 1000.0
+    except Exception:
+        return 0.0
+
+
 DEFAULT_SETTINGS = {
     "opacity":        0.92,
     "compact":        False,
@@ -821,9 +840,22 @@ class JeanClaudeCombien:
 
     def _cache_is_fresh(self) -> bool:
         """True if the usage cache currently has valid percentages and
-        was written within the last 5 minutes. Tightened from 10 → 5 min:
-        if we haven't heard a fresh 'ok:' in 5 min, the scheduler is
-        suspect anyway and the watchdog will respawn us shortly."""
+        was written recently enough that an `expired` signal is suspect.
+
+        Two windows:
+        * 5 min in steady state — if we haven't heard a fresh 'ok:' in
+          5 min, the scheduler is suspect anyway and the watchdog will
+          respawn us shortly.
+        * 1 h during the first 10 min after system boot — cold-boot
+          post-reboot incident (2026-05-29) showed Anthropic backend
+          can return real 401 for >6 min while the OS network stack
+          (TLS, DNS, antivirus, VPN) finishes warming up. PR #5's
+          30 s × 2 = 60 s retry was sized for wake-from-standby and
+          can't absorb that window. During cold boot we trust a cache
+          up to 1 h old: if the previous run wrote a successful tick
+          right before shutdown (typical case), the key was demonstrably
+          valid <1 h ago and a transient 401 right after boot is the
+          cold-network race, not real expiry."""
         try:
             cache = json.loads(CACHE_FILE.read_text("utf-8"))
         except (OSError, ValueError):
@@ -834,7 +866,15 @@ class JeanClaudeCombien:
             fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
         except (KeyError, ValueError, TypeError):
             return False
-        return time.time() - fetched < 300
+        age = time.time() - fetched
+        if age < 300:
+            return True
+        if age < 3600 and _system_uptime_s() < 600:
+            fetch_usage._log(
+                f"prompt: cache age {int(age)}s within cold-boot window "
+                f"(uptime {int(_system_uptime_s())}s)")
+            return True
+        return False
 
     def _spawn_setup_now(self):
         setup_path = Path(__file__).with_name("setup.py")
