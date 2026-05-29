@@ -36,6 +36,20 @@ try:
 except Exception:
     pass  # best-effort; staying on /dev/null is no worse than today
 
+# Cleanup stale per-PID fetch logs (>1 day old). These accumulate when
+# fetch_usage._log falls through to its tier-2 fallback during a shared-
+# log deadlock; without cleanup the directory would grow forever.
+try:
+    cutoff = time.time() - 86_400
+    for stale in _LOG_DIR.glob("monitor_fetch_*.log"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass
+except Exception:
+    pass
+
 # Distinct AppUserModelID so Win11 shell treats this pythonw.exe instance
 # as its own application (separate from any sibling overlay like CHB).
 try:

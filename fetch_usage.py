@@ -2,7 +2,7 @@
 Получает данные с claude.ai через cloudscraper + sessionKey.
 Сохраняет в monitor_usage_cache.json.
 """
-import json, os, sys
+import json, os, sys, threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -13,40 +13,66 @@ SESSION    = CLAUDE_DIR / "monitor_session.json"
 ORG_CACHE  = CLAUDE_DIR / "monitor_org.json"
 
 
-_LOG = CLAUDE_DIR / "monitor_fetch.log"
+_LOG          = CLAUDE_DIR / "monitor_fetch.log"
+_LOG_FALLBACK = CLAUDE_DIR / f"monitor_fetch_{os.getpid()}.log"
+_LOG_TIMEOUT  = 1.0
+
+
+def _try_write(target: Path, line: str) -> bool:
+    """Synchronous write to a log file with rotation. Returns True on
+    success; on any exception returns False (caller falls through to
+    the next tier)."""
+    try:
+        if target.exists() and target.stat().st_size > 64_000:
+            tail = target.read_text(encoding="utf-8", errors="ignore")[-32_000:]
+            tmp  = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_text(tail, encoding="utf-8")
+            os.replace(tmp, target)
+        with target.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+        return True
+    except Exception:
+        return False
 
 
 def _log(msg: str) -> None:
     """Append a single line to the rolling fetch log. The file is the
     smoking-gun for diagnosing 'why did setup pop up at 01:42'.
 
-    Two robustness fixes against past zombie incidents:
-    * Rotation uses .tmp + os.replace so a concurrent reader can never
-      see a half-written file (atomic on Windows for same-directory).
-    * On any open/write failure we fall through to sys.stderr (which
-      claude_monitor.py's startup block redirects into monitor_stderr.log).
-      The 2026-05-27 incident left zero trail in monitor_fetch.log
-      because something — most likely a zombie handle — blocked our
-      'a'-mode opens. Stderr is a separate descriptor and survives.
+    Three-tier write to survive the incident-4 deadlock pattern:
+      1. Shared `monitor_fetch.log` via a worker thread with a 1 s
+         timeout. A zombie sibling process can hold a file handle in a
+         way that makes the open or write block — by isolating the
+         write on a daemon thread we never freeze the caller. The
+         daemon thread is left to finish on its own (or never, if the
+         lock outlives the process), which is harmless.
+      2. Per-PID `monitor_fetch_<pid>.log`. Each interpreter writes its
+         own file, so there is no shared handle to contend on. This
+         file is the post-mortem source of truth when the shared log
+         goes silent. Cleanup of old per-PID files happens at
+         startup in claude_monitor.py.
+      3. `sys.stderr`, which claude_monitor.py redirects into
+         monitor_stderr.log at startup. Last resort, always
+         non-blocking.
     """
     ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts}  {msg}\n"
-    try:
-        # Cap at 64 KB so the log never bloats indefinitely.
-        if _LOG.exists() and _LOG.stat().st_size > 64_000:
-            tail = _LOG.read_text(encoding="utf-8", errors="ignore")[-32_000:]
-            tmp  = _LOG.with_suffix(_LOG.suffix + ".tmp")
-            tmp.write_text(tail, encoding="utf-8")
-            os.replace(tmp, _LOG)
-        with _LOG.open("a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
+
+    shared_ok = {"v": False}
+    def shared_writer():
+        shared_ok["v"] = _try_write(_LOG, line)
+    t = threading.Thread(target=shared_writer, daemon=True)
+    t.start()
+    t.join(_LOG_TIMEOUT)
+    if shared_ok["v"]:
         return
-    except Exception as e:
-        primary_err = type(e).__name__
-    # Fallback path — keep visibility even when the primary log is dead.
+
+    if _try_write(_LOG_FALLBACK, line):
+        return
+
     try:
-        sys.stderr.write(f"[_log-fallback {primary_err}] {line}")
+        sys.stderr.write(f"[_log-final-fallback] {line}")
         sys.stderr.flush()
     except Exception:
         pass
