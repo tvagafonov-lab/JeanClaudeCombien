@@ -406,6 +406,17 @@ class JeanClaudeCombien:
         self._build_content()
         self._fit_height()
         self._refresh_ui()
+        # Startup breadcrumb: several incidents (7v1/7v3) left ZERO lines
+        # in monitor_fetch.log even though Setup popped — we could never
+        # tell whether _bg_fetch ran at all. Logging the PID + uptime at
+        # __init__ gives every future incident an anchored "process N
+        # started" marker to reason from.
+        try:
+            fetch_usage._log(
+                f"init: monitor PID {os.getpid()} started "
+                f"(sys_uptime {int(_system_uptime_s())}s)")
+        except Exception:
+            pass
         self._schedule_bg_fetch()
         # Independent daemon-thread that respawns the process if the
         # tk-mainloop-driven scheduler stops ticking. Lives outside tk
@@ -586,7 +597,13 @@ class JeanClaudeCombien:
         now   = datetime.now(tz=timezone.utc)   # single snapshot for the whole tick
 
         for i, (key_pct, key_rst, icon, name_key, win_s) in enumerate(ROWS):
-            pct = float(cache.get(key_pct, 0))
+            # dict.get(k, default) returns the default ONLY when k is missing;
+            # if k is present with a None value (Anthropic API briefly returned
+            # ex_pct=null on 2026-06-04, which froze the UI and silenced the
+            # scheduler until the watchdog respawn — see vault incident #7v2),
+            # `.get(k, 0)` returns None and float(None) raises TypeError. The
+            # `or 0` guard collapses both missing and null into 0.0.
+            pct = float(cache.get(key_pct) or 0)
             if key_rst is not None and reset_passed(cache.get(key_rst), now):
                 pct = 0.0  # stale cache after window rollover
             if   key_pct == "fh_pct": self._last_pct_5h = pct
@@ -760,37 +777,41 @@ class JeanClaudeCombien:
                     pass
             error_kind = result.get("error") if isinstance(result, dict) else None
             if error_kind in ("expired", "no_session"):
-                # PR #4 restored the simple "expired -> _prompt_session_refresh"
-                # path because the Cloudflare-403 false-positives the old
-                # streak/cache_age guards were chasing had already been
-                # filtered out in fetch_usage._is_expired. That left one
-                # remaining race: a process that wakes (or gets respawned
-                # by the watchdog) right when the OS network stack is
-                # still mid-handshake can see a single real 401 from
-                # Anthropic before the connection settles. Pristine path
-                # treated that as expired and opened setup.py.
+                # Permanent fix (incident series, 2026-05-13…2026-06-10):
+                # auto-spawn of setup.py is PERMANENTLY REMOVED. In every
+                # recorded incident the sessionKey was still valid and the
+                # 'expired'/'no_session' signal was a transient artifact of
+                # reboot / wake-from-hibernate / fast-startup races —
+                # cloudscraper failing Cloudflare's TLS challenge while the
+                # network stack warms up, or the API briefly serving nulls.
+                # Five generations of guards (streaks, cache-age windows,
+                # system-uptime and process-uptime grace) all eventually
+                # failed open on some new scenario, because any guard that
+                # CAN fail open WILL once the right race shows up. The only
+                # spawn that cannot false-fire is one that never fires by
+                # itself.
                 #
-                # One-tick retry absorbs that case without bringing back
-                # the old guard chain: the FIRST expired tick just sets
-                # the header and reschedules _bg_fetch in 30 s. A truly
-                # expired key stays expired across the gap and the SECOND
-                # consecutive tick escalates to _prompt_session_refresh
-                # (which still does its own verify before the dialog).
-                # Sized at 1 retry (not 5 like the old streak) because
-                # _is_expired is strict — a confirmed 401 thirty seconds
-                # apart is real expiry.
+                # A truly expired key now shows a persistent "⚠ session"
+                # status while the periodic 3-min cadence keeps probing
+                # (so a revived backend clears the state on its own); the
+                # user re-enters the key via the context menu
+                # (🔑 Setup sessionKey…). Real expiry is a months-scale
+                # event — a visible indicator is the right cost for never
+                # again popping a login dialog over a valid key.
                 expired_streak = getattr(self, "_expired_streak", 0) + 1
                 self._expired_streak = expired_streak
                 self._fetch_backoff_ms = 5_000
                 self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                if expired_streak >= 2:
+                if expired_streak == 1:
+                    # One quick retry still absorbs the single-401
+                    # cold-network race (PR #5) without waiting 3 min.
                     fetch_usage._log(
-                        f"expired-tick {expired_streak} ({error_kind}); escalating to _prompt_session_refresh")
-                    self.root.after(0, self._prompt_session_refresh)
+                        f"expired-tick 1 ({error_kind}); retry in 30 s")
+                    self.root.after(30_000, self._bg_fetch)
                 else:
                     fetch_usage._log(
-                        f"expired-tick {expired_streak} ({error_kind}); retry in 30 s before escalating")
-                    self.root.after(30_000, self._bg_fetch)
+                        f"expired-tick {expired_streak} ({error_kind}); "
+                        f"auto-spawn removed — periodic retry continues")
             elif err:
                 self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
                 # Right after sign-in the network stack may not be up yet —
@@ -860,16 +881,24 @@ class JeanClaudeCombien:
         * 5 min in steady state — if we haven't heard a fresh 'ok:' in
           5 min, the scheduler is suspect anyway and the watchdog will
           respawn us shortly.
-        * 1 h during the first 10 min after system boot — cold-boot
-          post-reboot incident (2026-05-29) showed Anthropic backend
-          can return real 401 for >6 min while the OS network stack
-          (TLS, DNS, antivirus, VPN) finishes warming up. PR #5's
-          30 s × 2 = 60 s retry was sized for wake-from-standby and
-          can't absorb that window. During cold boot we trust a cache
-          up to 1 h old: if the previous run wrote a successful tick
-          right before shutdown (typical case), the key was demonstrably
-          valid <1 h ago and a transient 401 right after boot is the
-          cold-network race, not real expiry."""
+        * 12 h during the first 10 min of *monitor process* uptime —
+          covers two distinct races behind one guard:
+            – cold boot (2026-05-29 incident): Anthropic backend can
+              return real 401 for >6 min while the OS network stack
+              (TLS, DNS, AV, VPN) warms up; PR #5's 60 s retry can't
+              absorb that.
+            – wake from overnight hibernate + watchdog respawn
+              (2026-05-31 incident): Windows uptime is huge but the
+              monitor process is fresh; PR #6's Windows-uptime gate
+              missed this entirely. cloudscraper also takes 2-3 tries
+              to pass Cloudflare's TLS challenge after a long sleep,
+              and the first try can surface as `no_session` /
+              `expired` even though the key is valid.
+          A 12 h window covers a typical overnight pause; if the
+          previous run wrote a successful tick before shutdown
+          (the common case), the key was demonstrably valid earlier
+          today and a transient auth signal right after process start
+          is the network race, not real expiry."""
         try:
             cache = json.loads(CACHE_FILE.read_text("utf-8"))
         except (OSError, ValueError):
@@ -883,10 +912,29 @@ class JeanClaudeCombien:
         age = time.time() - fetched
         if age < 300:
             return True
-        if age < 3600 and _system_uptime_s() < 600:
+        sys_uptime  = _system_uptime_s()
+        proc_uptime = time.time() - self._start_time
+        # Process-uptime trust window: while the monitor process is fresh,
+        # ANY non-error cache is enough — the failure mode we keep hitting
+        # post-reboot/wake is cloudscraper getting 401'd or aborted by
+        # Cloudflare during the first minutes after process start while
+        # the network stack and TLS challenge warm up. Better to display
+        # slightly stale numbers for 10 min than to pop Setup on the user
+        # every reboot. The 2026-06-05 incident (cache age 35 h, beyond
+        # the previous 12 h trust window) confirmed that bounding trust
+        # by cache age while the process is fresh is the wrong axis.
+        if proc_uptime < 600:
             fetch_usage._log(
-                f"prompt: cache age {int(age)}s within cold-boot window "
-                f"(uptime {int(_system_uptime_s())}s)")
+                f"prompt: cache age {int(age)}s trusted during process-uptime "
+                f"window (sys_uptime {int(sys_uptime)}s, proc_uptime {int(proc_uptime)}s)")
+            return True
+        # System-uptime guard kept as a safety net for the very first
+        # post-reboot launch when the monitor process is older than 10 min
+        # but Windows itself was just up (e.g. respawn cascade during boot).
+        if age < 43_200 and sys_uptime < 600:
+            fetch_usage._log(
+                f"prompt: cache age {int(age)}s within system-uptime window "
+                f"(sys_uptime {int(sys_uptime)}s)")
             return True
         return False
 

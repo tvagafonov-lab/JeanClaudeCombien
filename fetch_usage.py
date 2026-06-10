@@ -168,20 +168,27 @@ def fetch_and_save() -> dict:
     dz = usage.get("seven_day_omelette") or {}
     eu = usage.get("extra_usage")        or {}
 
+    # Null-safety: dict.get(k, default) returns the default ONLY when the
+    # key is missing. When Anthropic returns an explicit `null` for a
+    # field (observed for `used_credits`/`monthly_limit`/`utilization`
+    # in `extra_usage` on 2026-06-05 ~16:47 UTC), `.get(k, 0)` returns
+    # None, and any arithmetic like `None / 100` raises TypeError —
+    # which froze fetch_and_save in `err: TypeError` for 2.5h before
+    # the next reboot. The `or 0` collapses missing+null into 0.
     # used_credits и monthly_limit приходят в центах → делим на 100
     result = {
-        "fh_pct":   fh.get("utilization", 0),
+        "fh_pct":   fh.get("utilization") or 0,
         "fh_reset": fh.get("resets_at"),
-        "wd_pct":   sd.get("utilization", 0),
+        "wd_pct":   sd.get("utilization") or 0,
         "wd_reset": sd.get("resets_at"),
-        "sn_pct":   sn.get("utilization", 0),
+        "sn_pct":   sn.get("utilization") or 0,
         "sn_reset": sn.get("resets_at"),
-        "dz_pct":   dz.get("utilization", 0),
+        "dz_pct":   dz.get("utilization") or 0,
         "dz_reset": dz.get("resets_at"),
-        "ex_used":  eu.get("used_credits", 0) / 100,
-        "ex_limit": eu.get("monthly_limit", 0) / 100,
-        "ex_pct":   eu.get("utilization", 0),
-        "ex_curr":  eu.get("currency", ""),
+        "ex_used":  (eu.get("used_credits")  or 0) / 100,
+        "ex_limit": (eu.get("monthly_limit") or 0) / 100,
+        "ex_pct":   eu.get("utilization") or 0,
+        "ex_curr":  eu.get("currency") or "",
         "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
     }
 
