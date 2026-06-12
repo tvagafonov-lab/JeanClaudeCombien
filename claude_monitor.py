@@ -392,7 +392,6 @@ class JeanClaudeCombien:
         self._body            = None
         self._rows_widgets    = []
         self._known_mtime     = 0.0
-        self._last_fetch_time = 0.0
         self._refresh_id      = None
         # Tray state — deferred entry so the icon doesn't bake in 0 % on
         # the initial cold-cache refresh.
@@ -755,82 +754,77 @@ class JeanClaudeCombien:
         self._refresh_ui()
 
     # ── Background fetch ──────────────────────────────────────────────────────
-    def _bg_fetch(self):
-        # Heartbeat for the watchdog. Set on the main thread before the
-        # worker is dispatched so a thread-creation failure still bumps it
-        # (the watchdog only cares whether _bg_fetch was entered at all).
-        self._last_tick_ts = time.time()
-
-        def run():
-            err = None
-            result = None
+    def _fetch_once(self) -> str:
+        """Run one synchronous fetch and marshal the result onto the UI.
+        Returns 'ok' | 'err' | 'expired'. Called only from the fetch
+        scheduler thread (never the tk main thread), so it may block on
+        the network freely."""
+        err = None
+        result = None
+        try:
+            result = fetch_usage.fetch_and_save()
+        except Exception as e:
+            err = type(e).__name__
+            # A silenced exception here used to make monitor_fetch.log stop
+            # growing while the process stayed alive. Surface every failure.
             try:
-                result = fetch_usage.fetch_and_save()
-            except Exception as e:
-                err = type(e).__name__
-                # A silenced exception here used to make monitor_fetch.log
-                # stop growing while the process stayed alive. Now every
-                # raised failure surfaces in the same triage file.
-                try:
-                    fetch_usage._log(f"err: {err}: {str(e)[:160]}")
-                except Exception:
-                    pass
-            error_kind = result.get("error") if isinstance(result, dict) else None
-            if error_kind in ("expired", "no_session"):
-                # Permanent fix (incident series, 2026-05-13…2026-06-10):
-                # auto-spawn of setup.py is PERMANENTLY REMOVED. In every
-                # recorded incident the sessionKey was still valid and the
-                # 'expired'/'no_session' signal was a transient artifact of
-                # reboot / wake-from-hibernate / fast-startup races —
-                # cloudscraper failing Cloudflare's TLS challenge while the
-                # network stack warms up, or the API briefly serving nulls.
-                # Five generations of guards (streaks, cache-age windows,
-                # system-uptime and process-uptime grace) all eventually
-                # failed open on some new scenario, because any guard that
-                # CAN fail open WILL once the right race shows up. The only
-                # spawn that cannot false-fire is one that never fires by
-                # itself.
-                #
-                # A truly expired key now shows a persistent "⚠ session"
-                # status while the periodic 3-min cadence keeps probing
-                # (so a revived backend clears the state on its own); the
-                # user re-enters the key via the context menu
-                # (🔑 Setup sessionKey…). Real expiry is a months-scale
-                # event — a visible indicator is the right cost for never
-                # again popping a login dialog over a valid key.
-                expired_streak = getattr(self, "_expired_streak", 0) + 1
-                self._expired_streak = expired_streak
-                self._fetch_backoff_ms = 5_000
-                self.root.after(0, lambda: self._upd_var.set("⚠ session"))
-                if expired_streak == 1:
-                    # One quick retry still absorbs the single-401
-                    # cold-network race (PR #5) without waiting 3 min.
-                    fetch_usage._log(
-                        f"expired-tick 1 ({error_kind}); retry in 30 s")
-                    self.root.after(30_000, self._bg_fetch)
-                else:
-                    fetch_usage._log(
-                        f"expired-tick {expired_streak} ({error_kind}); "
-                        f"auto-spawn removed — periodic retry continues")
-            elif err:
-                self.root.after(0, lambda: self._upd_var.set(f"⚠ {err}"))
-                # Right after sign-in the network stack may not be up yet —
-                # retry with exponential backoff so we don't sit on a cold
-                # cache until the 3-min fallback.
-                retry_ms = getattr(self, "_fetch_backoff_ms", 5_000)
-                if retry_ms <= 60_000:
-                    self.root.after(retry_ms, self._bg_fetch)
-                    self._fetch_backoff_ms = retry_ms * 3
-            else:
-                # Successful fetch — reset the cold-network retry counter.
-                self._expired_streak = 0
-                self._fetch_backoff_ms = 5_000
-                self.root.after(0, self._refresh_ui)
-                # Enter tray only once the cache is populated so the icon's
-                # first render already has real percentages.
-                self.root.after(0, self._enter_tray_if_pending)
-        threading.Thread(target=run, daemon=True).start()
+                fetch_usage._log(f"err: {err}: {str(e)[:160]}")
+            except Exception:
+                pass
+        error_kind = result.get("error") if isinstance(result, dict) else None
+        if error_kind in ("expired", "no_session"):
+            # Auto-spawn of setup.py is permanently removed (incident series
+            # 2026-05-13…2026-06-10): a valid key kept getting a transient
+            # 'expired' right after reboot/wake while the network warmed up.
+            # Show a persistent indicator; the next loop tick clears it once
+            # the backend answers cleanly. A genuinely dead key is re-entered
+            # by the user via the context menu (🔑 Setup sessionKey…).
+            self.root.after(0, lambda: self._upd_var.set("⚠ session"))
+            fetch_usage._log(
+                f"expired ({error_kind}); indicator shown, periodic retry continues")
+            return "expired"
+        if err:
+            self.root.after(0, lambda e=err: self._upd_var.set(f"⚠ {e}"))
+            return "err"
+        self.root.after(0, self._refresh_ui)
+        # Enter tray only once the cache is populated so the icon's first
+        # render already has real percentages.
+        self.root.after(0, self._enter_tray_if_pending)
+        return "ok"
+
+    def _fetch_scheduler_loop(self):
+        """Drive fetches from an independent daemon thread paced by
+        time.sleep — NOT tk's root.after.
+
+        ROOT-CAUSE FIX for the scheduler-zombie incidents (2026-05…06):
+        tk's after() timers stop firing after the machine wakes from
+        hibernation, so the old root.after-chained poll loop went silent
+        while the process stayed alive (4 threads, zero fetches, frozen
+        numbers — what looked like 'asks for login / won't connect'). A
+        plain time.sleep loop survives hibernate: the thread just resumes
+        late and keeps polling. UI writes still hop onto the tk thread via
+        root.after(0, …), which keeps working because the mainloop itself
+        is alive — only *deferred* timers were the broken part."""
         self._upd_var.set("↻ …")
+        time.sleep(3)  # let the network stack come up after sign-in/unlock
+        while True:
+            self._last_tick_ts = time.time()   # heartbeat for the watchdog
+            try:
+                status = self._fetch_once()
+            except Exception:
+                status = "err"
+            # ok → full 3-min cadence; transient failure → retry in 30 s so a
+            # cold-network miss right after wake recovers fast instead of
+            # sitting on a stale cache for three minutes.
+            wait_s = (REFETCH_INTERVAL_MS // 1000) if status == "ok" else 30
+            slept = 0
+            while slept < wait_s:
+                time.sleep(min(5, wait_s - slept))
+                slept += 5
+                # buddy-tokens.json moved → fetch ahead of cadence, but no
+                # more than ~once per 30 s to respect the API cooldown.
+                if slept >= 30 and self._token_file_changed():
+                    break
 
     def _prompt_session_refresh(self):
         """Open the setup dialog when fetch_usage reports auth failure.
@@ -1166,46 +1160,29 @@ class JeanClaudeCombien:
             except Exception: pass
             self._hover_card = None
 
-    def _watch_tokens(self):
-        """Every 5 s: re-fetch if buddy-tokens.json changed (30 s API cooldown)."""
+    def _token_file_changed(self) -> bool:
+        """True (once) when buddy-tokens.json has a newer mtime than last
+        seen — Claude Desktop just wrote fresh token counts, so fetch ahead
+        of the normal cadence. Self-updates the baseline."""
         try:
-            mt  = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
-            now = time.time()
-            if mt > self._known_mtime and now - self._last_fetch_time >= 30:
-                self._known_mtime     = mt
-                self._last_fetch_time = now
-                self._bg_fetch()
+            mt = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
+            if mt > self._known_mtime:
+                self._known_mtime = mt
+                return True
         except Exception:
             pass
-        self.root.after(5_000, self._watch_tokens)
+        return False
 
     def _schedule_bg_fetch(self):
-        """Wire up the initial fetch, the file watcher, and the periodic
-        re-fetch timer. Called once from __init__."""
+        """Start the self-pacing fetch thread. Called once from __init__.
+        Replaces the old root.after fetch/watch/periodic chain, which went
+        silent after hibernate (see _fetch_scheduler_loop for the why)."""
         try:
             self._known_mtime = TOKENS_FILE.stat().st_mtime if TOKENS_FILE.exists() else 0.0
         except Exception:
             self._known_mtime = 0.0
-        self._last_fetch_time = time.time()
-        # Small delay on the very first fetch so the Windows network stack
-        # has time to come up after sign-in / unlock.
-        self.root.after(3_000, self._bg_fetch)
-        self.root.after(5_000, self._watch_tokens)
-        # Periodic re-fetch. Rearm-before-fire so a raised exception in
-        # _bg_fetch can't break the chain — earlier versions chained the
-        # next tick at the *end* of the function, which meant a single
-        # lost callback (wake/standby/zombie) silenced the scheduler
-        # forever. The watchdog still backstops genuine hangs.
-        self.root.after(REFETCH_INTERVAL_MS, self._periodic_bg_fetch)
-
-    def _periodic_bg_fetch(self):
-        """Self-rearming periodic tick. Rearms before firing so a single
-        callback failure cannot break the chain."""
-        self.root.after(REFETCH_INTERVAL_MS, self._periodic_bg_fetch)
-        try:
-            self._bg_fetch()
-        except Exception:
-            pass
+        threading.Thread(target=self._fetch_scheduler_loop,
+                         name="fetch-scheduler", daemon=True).start()
 
     # ── Drag ──────────────────────────────────────────────────────────────────
     def _drag_start(self, e): self._ox, self._oy = e.x, e.y
