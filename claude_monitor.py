@@ -806,13 +806,35 @@ class JeanClaudeCombien:
         root.after(0, …), which keeps working because the mainloop itself
         is alive — only *deferred* timers were the broken part."""
         self._upd_var.set("↻ …")
+        # Seed the heartbeat so the watchdog grants the first fetch its full
+        # WATCHDOG_FATAL_S window to land before judging the process dead.
+        self._last_tick_ts = time.time()
         time.sleep(3)  # let the network stack come up after sign-in/unlock
+        fail_streak = 0
         while True:
-            self._last_tick_ts = time.time()   # heartbeat for the watchdog
             try:
                 status = self._fetch_once()
             except Exception:
                 status = "err"
+            if status == "ok":
+                # HEARTBEAT TRACKS SUCCESSFUL FETCHES ONLY (incident
+                # 2026-06-22). A process that woke from hibernate kept this
+                # loop spinning while every fetch failed silently — a broken
+                # network stack *inside* the long-lived process, even though
+                # a fresh process fetched in 3 s. When the heartbeat tracked
+                # mere attempts, the watchdog saw a 'healthy' process and
+                # never respawned it, so the overlay froze for days. Bumping
+                # it only on success lets a failure run past WATCHDOG_FATAL_S
+                # respawn the process — and the fresh one fetches cleanly.
+                self._last_tick_ts = time.time()
+                if fail_streak:
+                    fetch_usage._log(f"recovered after {fail_streak} failed fetch(es)")
+                fail_streak = 0
+            else:
+                fail_streak += 1
+                fetch_usage._log(
+                    f"fetch {status}; fail_streak={fail_streak} — heartbeat held, "
+                    f"watchdog respawns after {WATCHDOG_FATAL_S}s of failures")
             # ok → full 3-min cadence; transient failure → retry in 30 s so a
             # cold-network miss right after wake recovers fast instead of
             # sitting on a stale cache for three minutes.
