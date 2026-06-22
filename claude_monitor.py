@@ -112,6 +112,11 @@ SETTINGS_FILE = CLAUDE_DIR / "monitor_settings.json"
 # and os._exit(2). Sized as 3× the 180 s fetch cadence with one tick of
 # slack — anything past three lost ticks is unambiguously dead.
 WATCHDOG_FATAL_S = 600
+# Objective liveness backstop independent of the in-process heartbeat: if the
+# usage cache file hasn't been written (= no fetch has actually succeeded) for
+# this long, the process is a silent-fetch zombie (incident 2026-06-22) and
+# the watchdog respawns it even though its heartbeat looks healthy.
+CACHE_STALE_S = 360
 
 
 try:
@@ -809,7 +814,14 @@ class JeanClaudeCombien:
         # Seed the heartbeat so the watchdog grants the first fetch its full
         # WATCHDOG_FATAL_S window to land before judging the process dead.
         self._last_tick_ts = time.time()
-        time.sleep(3)  # let the network stack come up after sign-in/unlock
+        # Cold-start guard (incident 2026-06-22): a monitor launched by the
+        # Startup shortcut the instant the user logs in after wake races the
+        # network stack. Firing fetches into a dead network drove the process
+        # into a wedged state it never recovered from — a silent zombie that
+        # logged nothing and fetched nothing for hours, while a process
+        # started later in a warm system worked. Wait for a live socket
+        # before the first fetch instead of a blind 3 s sleep.
+        self._await_network_ready()
         fail_streak = 0
         while True:
             try:
@@ -847,6 +859,29 @@ class JeanClaudeCombien:
                 # more than ~once per 30 s to respect the API cooldown.
                 if slept >= 30 and self._token_file_changed():
                     break
+
+    def _await_network_ready(self, max_wait: int = 300):
+        """Block until claude.ai:443 accepts a TCP connection, up to max_wait
+        seconds. Cold-start guard (see the caller): a live socket means the
+        network stack, DNS and any VPN/AV are up, so the first cloudscraper
+        fetch won't hammer a dead connection and wedge the process into the
+        silent-zombie state. If the network never comes up within max_wait we
+        start anyway — the periodic loop and the cache-staleness watchdog
+        recover from there."""
+        import socket
+        deadline = time.time() + max_wait
+        attempt = 0
+        while time.time() < deadline:
+            try:
+                socket.create_connection(("claude.ai", 443), timeout=5).close()
+                if attempt:
+                    fetch_usage._log(f"network ready after {attempt} probe(s)")
+                return
+            except OSError:
+                attempt += 1
+                self.root.after(0, lambda: self._upd_var.set("↻ net…"))
+                time.sleep(5)
+        fetch_usage._log(f"network not ready after {max_wait}s; fetching anyway")
 
     def _prompt_session_refresh(self):
         """Open the setup dialog when fetch_usage reports auth failure.
@@ -983,11 +1018,32 @@ class JeanClaudeCombien:
             try:
                 time.sleep(60)
                 stale = time.time() - getattr(self, "_last_tick_ts", self._start_time)
+                proc_age = time.time() - self._start_time
+                # Two independent respawn triggers:
+                #  1) heartbeat stale — the loop stopped ticking at all;
+                #  2) cache stale — the loop ticks but no fetch has SUCCEEDED
+                #     (written the cache) for CACHE_STALE_S. This catches the
+                #     silent-fetch zombie (incident 2026-06-22) whose heartbeat
+                #     looked healthy while it fetched nothing. Gated on
+                #     proc_age so a freshly started process (which may legit-
+                #     imately wait on _await_network_ready before its first
+                #     write) isn't killed before it gets a chance.
+                cache_stale = None
+                try:
+                    cache_stale = time.time() - CACHE_FILE.stat().st_mtime
+                except OSError:
+                    pass
+                reason = None
                 if stale > WATCHDOG_FATAL_S:
+                    reason = f"scheduler stale {stale:.0f}s >{WATCHDOG_FATAL_S}s"
+                elif (proc_age > CACHE_STALE_S and cache_stale is not None
+                        and cache_stale > CACHE_STALE_S):
+                    reason = (f"cache stale {cache_stale:.0f}s >{CACHE_STALE_S}s "
+                              f"(silent-fetch zombie)")
+                if reason:
                     try:
                         fetch_usage._log(
-                            f"watchdog: scheduler stale for {stale:.0f}s "
-                            f">{WATCHDOG_FATAL_S}s; respawning self and exiting")
+                            f"watchdog: {reason}; respawning self and exiting")
                     except Exception:
                         pass
                     try:
