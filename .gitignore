@@ -25,3 +25,7 @@ monitor_settings.json
 # OS
 Thumbs.db
 .DS_Store
+
+# Local-only artifacts
+*.lnk.disabled
+monitor_guard.log
