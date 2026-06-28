@@ -146,56 +146,70 @@ def fetch_and_save() -> dict:
         _log("no_session: empty sessionKey field")
         return {"error": "no_session"}
 
-    s      = _get_scraper(key)
-    org_id = _get_org_id(s)
-    if org_id is None:
-        _log("expired: orgs endpoint reported invalid session")
-        return {"error": "expired"}
+    s = _get_scraper(key)
+    try:
+        org_id = _get_org_id(s)
+        if org_id is None:
+            _log("expired: orgs endpoint reported invalid session")
+            return {"error": "expired"}
 
-    r = s.get(
-        f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
-    )
-    if _is_expired(r):
-        ORG_CACHE.unlink(missing_ok=True)
-        _log(f"expired: usage endpoint reported invalid session "
-             f"(status={r.status_code} body={r.text[:120]!r})")
-        return {"error": "expired"}
-    usage = r.json()
+        r = s.get(
+            f"https://claude.ai/api/organizations/{org_id}/usage", timeout=15
+        )
+        if _is_expired(r):
+            ORG_CACHE.unlink(missing_ok=True)
+            _log(f"expired: usage endpoint reported invalid session "
+                 f"(status={r.status_code} body={r.text[:120]!r})")
+            return {"error": "expired"}
+        usage = r.json()
 
-    fh = usage.get("five_hour")          or {}
-    sd = usage.get("seven_day")          or {}
-    sn = usage.get("seven_day_sonnet")   or {}
-    dz = usage.get("seven_day_omelette") or {}
-    eu = usage.get("extra_usage")        or {}
+        fh = usage.get("five_hour")          or {}
+        sd = usage.get("seven_day")          or {}
+        sn = usage.get("seven_day_sonnet")   or {}
+        dz = usage.get("seven_day_omelette") or {}
+        eu = usage.get("extra_usage")        or {}
 
-    # Null-safety: dict.get(k, default) returns the default ONLY when the
-    # key is missing. When Anthropic returns an explicit `null` for a
-    # field (observed for `used_credits`/`monthly_limit`/`utilization`
-    # in `extra_usage` on 2026-06-05 ~16:47 UTC), `.get(k, 0)` returns
-    # None, and any arithmetic like `None / 100` raises TypeError —
-    # which froze fetch_and_save in `err: TypeError` for 2.5h before
-    # the next reboot. The `or 0` collapses missing+null into 0.
-    # used_credits и monthly_limit приходят в центах → делим на 100
-    result = {
-        "fh_pct":   fh.get("utilization") or 0,
-        "fh_reset": fh.get("resets_at"),
-        "wd_pct":   sd.get("utilization") or 0,
-        "wd_reset": sd.get("resets_at"),
-        "sn_pct":   sn.get("utilization") or 0,
-        "sn_reset": sn.get("resets_at"),
-        "dz_pct":   dz.get("utilization") or 0,
-        "dz_reset": dz.get("resets_at"),
-        "ex_used":  (eu.get("used_credits")  or 0) / 100,
-        "ex_limit": (eu.get("monthly_limit") or 0) / 100,
-        "ex_pct":   eu.get("utilization") or 0,
-        "ex_curr":  eu.get("currency") or "",
-        "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
+        # Null-safety: dict.get(k, default) returns the default ONLY when the
+        # key is missing. When Anthropic returns an explicit `null` for a
+        # field (observed for `used_credits`/`monthly_limit`/`utilization`
+        # in `extra_usage` on 2026-06-05 ~16:47 UTC), `.get(k, 0)` returns
+        # None, and any arithmetic like `None / 100` raises TypeError —
+        # which froze fetch_and_save in `err: TypeError` for 2.5h before
+        # the next reboot. The `or 0` collapses missing+null into 0.
+        # used_credits и monthly_limit приходят в центах → делим на 100
+        result = {
+            "fh_pct":   fh.get("utilization") or 0,
+            "fh_reset": fh.get("resets_at"),
+            "wd_pct":   sd.get("utilization") or 0,
+            "wd_reset": sd.get("resets_at"),
+            "sn_pct":   sn.get("utilization") or 0,
+            "sn_reset": sn.get("resets_at"),
+            "dz_pct":   dz.get("utilization") or 0,
+            "dz_reset": dz.get("resets_at"),
+            "ex_used":  (eu.get("used_credits")  or 0) / 100,
+            "ex_limit": (eu.get("monthly_limit") or 0) / 100,
+            "ex_pct":   eu.get("utilization") or 0,
+            "ex_curr":  eu.get("currency") or "",
+            "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
 
-    CACHE_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    _log(f"ok: fh={result['fh_pct']} wd={result['wd_pct']} "
-         f"sn={result['sn_pct']} dz={result['dz_pct']}")
-    return result
+        CACHE_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        _log(f"ok: fh={result['fh_pct']} wd={result['wd_pct']} "
+             f"sn={result['sn_pct']} dz={result['dz_pct']}")
+        return result
+    finally:
+        # Close the scraper's connection pool on EVERY call. _get_scraper
+        # builds a FRESH cloudscraper each time (to dodge Cloudflare
+        # fingerprint blocks). Leaving each one's requests.Session open
+        # leaked sockets / TLS contexts that piled up over hours until the
+        # long-lived process wedged and every fetch failed silently while a
+        # fresh process still fetched in 3 s — the "silent-fetch zombie"
+        # (layer 2, incidents 2026-06-22…29). Closing here releases the
+        # pool deterministically so the process doesn't accumulate state.
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
