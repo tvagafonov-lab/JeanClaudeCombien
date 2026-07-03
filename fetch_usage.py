@@ -1,6 +1,22 @@
 """
 Получает данные с claude.ai через cloudscraper + sessionKey.
 Сохраняет в monitor_usage_cache.json.
+
+Формат кэша (2026-07, под текущую структуру API claude.ai/.../usage):
+    {
+      "limits": [                        # динамический список активных лимитов
+        {"kind": "session",       "label_key": "row_5h",   "pct": 15, "reset": ISO, "severity": "normal"},
+        {"kind": "weekly_all",    "label_key": "row_week", "pct": 6,  "reset": ISO, "severity": "normal"},
+        {"kind": "weekly_scoped", "label": "Fable",        "pct": 9,  "reset": ISO, "severity": "normal"}
+      ],
+      "credits": {"used": 0.0, "limit": None, "balance": 2.84, "curr": "EUR", "pct": 0, "enabled": False},
+      "fh_pct": 15, "fh_reset": ISO,      # legacy: 5h — для tray-иконки и обратной совместимости
+      "wd_pct": 6,  "wd_reset": ISO,      # legacy: неделя
+      "fetched_at": ISO
+    }
+Источник в API: usage["limits"][] (унифицированный), usage["spend"] (кредиты/деньги),
+usage["five_hour"]/["seven_day"] (legacy). Поля seven_day_sonnet/opus/omelette и extra_usage
+устарели (приходят null) — больше не читаем напрямую, модельные лимиты берём из limits[].scope.
 """
 import json, os, sys, threading
 from pathlib import Path
@@ -136,6 +152,75 @@ def _get_org_id(s) -> str | None:
     return org_id
 
 
+_KIND_LABELS = {"session": "row_5h", "weekly_all": "row_week"}
+
+
+def _money(m) -> float:
+    """amount_minor + exponent → float (284 minor, exp 2 → 2.84)."""
+    if not isinstance(m, dict):
+        return 0.0
+    a, e = m.get("amount_minor"), m.get("exponent")
+    if a is None or e is None:
+        return 0.0
+    try:
+        return a / (10 ** e)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _parse_limits(usage: dict) -> list:
+    """Dynamic row list from usage['limits'][] — session, weekly_all, and any
+    weekly_scoped model limits. Named kinds (session/weekly_all) carry an
+    i18n label_key; scoped limits carry the model's display_name as `label`.
+    Falls back to five_hour/seven_day if limits[] is absent."""
+    rows = []
+    for lim in (usage.get("limits") or []):
+        kind = lim.get("kind")
+        row = {
+            "pct":      lim.get("percent") or 0,
+            "reset":    lim.get("resets_at"),
+            "severity": lim.get("severity") or "normal",
+            "kind":     kind,
+        }
+        if kind in _KIND_LABELS:
+            row["label_key"] = _KIND_LABELS[kind]
+        else:
+            model = ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+            if not model:
+                continue   # unknown scoped limit without a model name — skip
+            row["label"] = model
+        rows.append(row)
+    if rows:
+        return rows
+    # Fallback for an API shape without limits[]: synthesize from legacy blocks.
+    for key, lk in (("five_hour", "row_5h"), ("seven_day", "row_week")):
+        blk = usage.get(key)
+        if isinstance(blk, dict):
+            rows.append({"pct": blk.get("utilization") or 0,
+                         "reset": blk.get("resets_at"),
+                         "severity": "normal", "kind": key, "label_key": lk})
+    return rows
+
+
+def _parse_credits(usage: dict) -> dict:
+    """Credits / money from usage['spend'] (replaces the retired extra_usage)."""
+    spend   = usage.get("spend") or {}
+    used    = spend.get("used") or {}
+    balance = (spend.get("balance") or {}).get("money") or {}
+    limit   = spend.get("limit") or {}
+    # When spend is disabled we show `balance` (in its own currency, usually
+    # EUR here); when enabled we show used/limit. Prefer the balance currency
+    # for display since balance is the common case, falling back to used's.
+    return {
+        "used":    _money(used),
+        "limit":   _money(limit) if limit else None,
+        "balance": _money(balance),
+        "curr":    balance.get("currency") or used.get("currency") or "",
+        "pct":     spend.get("percent") or 0,
+        "enabled": bool(spend.get("enabled")),
+    }
+
+
 def fetch_and_save() -> dict:
     if not SESSION.exists():
         _log("no_session: session file missing")
@@ -163,39 +248,25 @@ def fetch_and_save() -> dict:
             return {"error": "expired"}
         usage = r.json()
 
-        fh = usage.get("five_hour")          or {}
-        sd = usage.get("seven_day")          or {}
-        sn = usage.get("seven_day_sonnet")   or {}
-        dz = usage.get("seven_day_omelette") or {}
-        eu = usage.get("extra_usage")        or {}
-
-        # Null-safety: dict.get(k, default) returns the default ONLY when the
-        # key is missing. When Anthropic returns an explicit `null` for a
-        # field (observed for `used_credits`/`monthly_limit`/`utilization`
-        # in `extra_usage` on 2026-06-05 ~16:47 UTC), `.get(k, 0)` returns
-        # None, and any arithmetic like `None / 100` raises TypeError —
-        # which froze fetch_and_save in `err: TypeError` for 2.5h before
-        # the next reboot. The `or 0` collapses missing+null into 0.
-        # used_credits и monthly_limit приходят в центах → делим на 100
+        fh = usage.get("five_hour") or {}
+        sd = usage.get("seven_day") or {}
         result = {
+            "limits":  _parse_limits(usage),
+            "credits": _parse_credits(usage),
+            # legacy 5h/week — the tray icon draws the 5h ring from these,
+            # and they are a safe fallback if `limits` ever comes back empty.
             "fh_pct":   fh.get("utilization") or 0,
             "fh_reset": fh.get("resets_at"),
             "wd_pct":   sd.get("utilization") or 0,
             "wd_reset": sd.get("resets_at"),
-            "sn_pct":   sn.get("utilization") or 0,
-            "sn_reset": sn.get("resets_at"),
-            "dz_pct":   dz.get("utilization") or 0,
-            "dz_reset": dz.get("resets_at"),
-            "ex_used":  (eu.get("used_credits")  or 0) / 100,
-            "ex_limit": (eu.get("monthly_limit") or 0) / 100,
-            "ex_pct":   eu.get("utilization") or 0,
-            "ex_curr":  eu.get("currency") or "",
             "fetched_at": datetime.now(tz=timezone.utc).isoformat(),
         }
 
         CACHE_FILE.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        cr = result["credits"]
         _log(f"ok: fh={result['fh_pct']} wd={result['wd_pct']} "
-             f"sn={result['sn_pct']} dz={result['dz_pct']}")
+             f"limits={len(result['limits'])} "
+             f"bal={cr['balance']:.2f}{cr['curr']}")
         return result
     finally:
         # Close the scraper's connection pool on EVERY call. _get_scraper

@@ -209,14 +209,47 @@ def _rect_on_screen(x: int, y: int, w: int, h: int, min_overlap: int = 40) -> bo
     return (min(x + w, vr) - max(x, vl) >= min_overlap
             and min(y + h, vb) - max(y, vt) >= min_overlap)
 
-ROWS = [
-    # (pct_key, reset_key, icon, label_key, window_seconds)
-    ("fh_pct", "fh_reset", "⏱", "row_5h",      5 * 3600),
-    ("wd_pct", "wd_reset", "📅", "row_week",   7 * 86400),
-    ("sn_pct", "sn_reset", "✨", "row_sonnet", 7 * 86400),
-    ("dz_pct", "dz_reset", "🎨", "row_design", 7 * 86400),
-    ("ex_pct", None,       "💳", "row_credits", 0),
-]
+# Icons for the fixed limit kinds; scoped model limits get _MODEL_ICON.
+_KIND_ICONS   = {"session": "⏱", "weekly_all": "📅"}
+_MODEL_ICON   = "✦"
+_CREDITS_ICON = "💳"
+
+
+def _display_rows(cache: dict, lang: str) -> list:
+    """Unified, ordered list of rows to render: one per limit in the cache
+    (session, weekly_all, then any scoped model limits) plus a credits row.
+
+    Single source of truth for cache→row mapping — _refresh_ui, the tray
+    tooltip and the hover card all render from this instead of each
+    re-parsing the cache. Each row is a dict:
+        {icon, label, pct, reset, credits}
+    where `reset` is an ISO string or None (credits has no reset) and
+    `credits` is the spend dict (used/limit/balance/curr/enabled) or None."""
+    out = []
+    for lim in (cache.get("limits") or []):
+        lk = lim.get("label_key")
+        if lk:                              # named kind (session / weekly_all)
+            label, icon = i18n.get(lang, lk), _KIND_ICONS.get(lim.get("kind"), "◆")
+        else:                               # scoped model limit — label is the model name
+            label, icon = (lim.get("label") or "?"), _MODEL_ICON
+        out.append({"icon": icon, "label": label, "pct": lim.get("pct") or 0,
+                    "reset": lim.get("reset"), "credits": None,
+                    "kind": lim.get("kind")})
+    cr = cache.get("credits")
+    if cr:
+        out.append({"icon": _CREDITS_ICON, "label": i18n.get(lang, "row_credits"),
+                    "pct": cr.get("pct") or 0, "reset": None, "credits": cr,
+                    "kind": "credits"})
+    return out
+
+
+def _credits_text(cr: dict) -> str:
+    """Reset-column text for the credits row: used/limit when spend is
+    enabled, otherwise the available balance."""
+    curr = "€" if cr.get("curr") == "EUR" else (cr.get("curr") or "")
+    if cr.get("enabled") and cr.get("limit"):
+        return f"{cr.get('used', 0):.2f} / {cr['limit']:.2f} {curr}".strip()
+    return f"{cr.get('balance', 0):.2f} {curr}".strip()
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -320,12 +353,6 @@ def ring_color(pct: float) -> tuple:
     if pct >= 90: return (255,  68,  68, 255)
     if pct >= 60: return (255, 176,  32, 255)
     return              ( 34, 220,  85, 255)
-
-
-def _pil_color(hex_str: str) -> tuple:
-    """Convert '#rrggbb' to an opaque RGBA tuple for Pillow."""
-    h = hex_str.lstrip("#")
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
 
 
 def _truncate_utf16(s: str, max_units: int = 127) -> str:
@@ -522,23 +549,26 @@ class JeanClaudeCombien:
                               padx=6 if compact else 10)
         self._body.pack(fill="x", pady=(4, 5))
 
+        # One blank row widget per current display row. Labels/icons live in
+        # StringVars filled by _refresh_ui, so only a change in the NUMBER of
+        # rows (a model limit appearing/disappearing) forces a rebuild — that
+        # check lives in _refresh_ui. `or [None]` keeps at least one row so a
+        # momentarily empty cache doesn't collapse the window.
+        n = len(_display_rows(read_cache(), lang)) or 1
         self._rows_widgets = []
-        for key_pct, key_rst, icon, name_key, _win_s in ROWS:
-            name = i18n.get(lang, name_key)
-            if compact:
-                w = self._make_compact_row(self._body, icon)
-            else:
-                w = self._make_full_row(self._body, icon, name)
+        for _ in range(n):
+            w = self._make_compact_row(self._body) if compact else self._make_full_row(self._body)
             self._rows_widgets.append(w)
 
         x, y = self.root.winfo_x(), self.root.winfo_y()
         self.root.geometry(f"{W}x1+{x}+{y}")
 
-    def _make_full_row(self, parent, icon: str, name: str) -> dict:
+    def _make_full_row(self, parent) -> dict:
         f = tk.Frame(parent, bg=C["bg"])
         f.pack(fill="x", pady=1)
 
-        tk.Label(f, text=f"{icon} {name}", bg=C["bg"], fg=C["muted"],
+        name_var = tk.StringVar(value="")
+        tk.Label(f, textvariable=name_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 7), width=12, anchor="w").pack(side="left")
 
         canvas = tk.Canvas(f, height=5, bg=C["bar"],
@@ -554,14 +584,15 @@ class JeanClaudeCombien:
         tk.Label(f, textvariable=rst_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="left", padx=(3, 0))
 
-        return {"mode": "full", "canvas": canvas,
+        return {"mode": "full", "canvas": canvas, "name_var": name_var,
                 "pct_var": pct_var, "pct_lbl": pct_lbl, "rst_var": rst_var}
 
-    def _make_compact_row(self, parent, icon: str) -> dict:
+    def _make_compact_row(self, parent) -> dict:
         f = tk.Frame(parent, bg=C["bg"])
         f.pack(fill="x", pady=1)
 
-        tk.Label(f, text=icon, bg=C["bg"], fg=C["muted"],
+        icon_var = tk.StringVar(value="")
+        tk.Label(f, textvariable=icon_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 8), width=2).pack(side="left")
 
         pct_var = tk.StringVar(value="—")
@@ -573,8 +604,8 @@ class JeanClaudeCombien:
         tk.Label(f, textvariable=rst_var, bg=C["bg"], fg=C["muted"],
                  font=("Segoe UI", 7)).pack(side="left", padx=(5, 0))
 
-        return {"mode": "compact", "pct_var": pct_var, "pct_lbl": pct_lbl,
-                "rst_var": rst_var}
+        return {"mode": "compact", "icon_var": icon_var, "pct_var": pct_var,
+                "pct_lbl": pct_lbl, "rst_var": rst_var}
 
     def _draw_bar(self, canvas: tk.Canvas, pct: float, color: str):
         canvas.update_idletasks()
@@ -599,29 +630,33 @@ class JeanClaudeCombien:
         cache = read_cache()
         lang  = self.cfg["lang"]
         now   = datetime.now(tz=timezone.utc)   # single snapshot for the whole tick
+        rows  = _display_rows(cache, lang)
 
-        for i, (key_pct, key_rst, icon, name_key, win_s) in enumerate(ROWS):
-            # dict.get(k, default) returns the default ONLY when k is missing;
-            # if k is present with a None value (Anthropic API briefly returned
-            # ex_pct=null on 2026-06-04, which froze the UI and silenced the
-            # scheduler until the watchdog respawn — see vault incident #7v2),
-            # `.get(k, 0)` returns None and float(None) raises TypeError. The
-            # `or 0` guard collapses both missing and null into 0.0.
-            pct = float(cache.get(key_pct) or 0)
-            if key_rst is not None and reset_passed(cache.get(key_rst), now):
+        # Rebuild the widgets only when we actually have rows AND their count
+        # changed (a scoped model limit appeared/disappeared). Guarding on
+        # `rows` is essential: an empty cache (no file yet, or a transient
+        # error) yields 0 rows while _build_content always makes at least 1
+        # widget — without the guard that mismatch would rebuild → _refresh_ui
+        # → rebuild forever (RecursionError). With rows present, the rebuild
+        # makes exactly len(rows) widgets, so the next tick matches and stops.
+        if rows and len(rows) != len(self._rows_widgets):
+            self._rebuild_ui()
+            return
+
+        for i, row in enumerate(rows):
+            pct = float(row["pct"] or 0)
+            if row["reset"] and reset_passed(row["reset"], now):
                 pct = 0.0  # stale cache after window rollover
-            if   key_pct == "fh_pct": self._last_pct_5h = pct
-            elif key_pct == "wd_pct": self._last_pct_wk = pct
+            # Track 5h / week for the tray icon ring.
+            if   row["kind"] == "session":    self._last_pct_5h = pct
+            elif row["kind"] == "weekly_all": self._last_pct_wk = pct
             color = bar_color(pct)
             w     = self._rows_widgets[i]
 
-            if key_rst is None:  # Credits row
-                used    = cache.get("ex_used",  0)
-                limit   = cache.get("ex_limit", 0)
-                curr    = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
-                rst_txt = f"{used:.2f} / {limit:.2f} {curr}"
+            if row["credits"] is not None:
+                rst_txt = _credits_text(row["credits"])
             else:
-                rst_txt = fmt_reset(cache.get(key_rst), lang, win_s, now)
+                rst_txt = fmt_reset(row["reset"], lang, 0, now)
 
             if w["mode"] == "dock":
                 self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
@@ -632,8 +667,11 @@ class JeanClaudeCombien:
                 w["pct_lbl"].config(fg=pct_color(pct))
                 w["rst_var"].set(rst_txt)
                 if w["mode"] == "full":
+                    w["name_var"].set(f"{row['icon']} {row['label']}")
                     self.root.after(30 * i, lambda c=w["canvas"], p=pct, col=color:
                                     self._draw_bar(c, p, col))
+                else:  # compact
+                    w["icon_var"].set(row["icon"])
 
         if cache.get("fetched_at"):
             try:
@@ -701,7 +739,7 @@ class JeanClaudeCombien:
 
     # ── Dock mode helpers ─────────────────────────────────────────────────────
     def _dock_width(self) -> int:
-        return len(ROWS) * (RING_SIZE + RING_PAD * 2) + 4
+        return len(self._rows_widgets) * (RING_SIZE + RING_PAD * 2) + 4
 
     def _dock_snap_pos(self, w: int, h: int) -> tuple:
         """Y: just above primary-monitor taskbar. X: saved dock_x, or a small
@@ -723,8 +761,9 @@ class JeanClaudeCombien:
         """Build the dock strip: one ring canvas per row, no header."""
         self._body = tk.Frame(self.root, bg=C["bg"])
         self._body.pack(fill="both", expand=True)
+        n = len(_display_rows(read_cache(), self.cfg["lang"])) or 1
         self._rows_widgets = []
-        for _key_pct, _key_rst, _icon, _name_key, _win_s in ROWS:
+        for _ in range(n):
             c = tk.Canvas(self._body, width=RING_SIZE, height=RING_SIZE,
                           bg=C["bg"], highlightthickness=0, bd=0)
             c.pack(side="left", padx=RING_PAD, pady=RING_PAD)
@@ -883,113 +922,13 @@ class JeanClaudeCombien:
                 time.sleep(5)
         fetch_usage._log(f"network not ready after {max_wait}s; fetching anyway")
 
-    def _prompt_session_refresh(self):
-        """Open the setup dialog when fetch_usage reports auth failure.
-
-        Three guards, in order:
-          1) one Popen at a time (poll the previous);
-          2) cache-freshness short-circuit — if the on-disk cache was
-             written by a successful fetch within the last 5 min, the
-             key is provably working and this 'expired' signal is a
-             transient blip;
-          3) final synchronous re-fetch — open the dialog ONLY if the
-             verification call still returns expired/no_session.
-
-        Deliberately NO cooldown / streak / uptime / persistent state.
-        Those were retrofitted to suppress Cloudflare-403 false-positives
-        which fetch_usage._is_expired already filters out — but they also
-        failed open whenever the scheduler went zombie and cache_age grew
-        on its own without help from real auth failures."""
-        fetch_usage._log("prompt: _prompt_session_refresh called")
+    def _spawn_setup_now(self):
+        """Launch setup.py to (re-)enter the sessionKey. Only reached from the
+        context menu (🔑 Setup sessionKey…) — never automatically. Guards
+        against spawning a second dialog while one is still open."""
         proc = getattr(self, "_setup_proc", None)
         if proc is not None and proc.poll() is None:
-            fetch_usage._log("prompt: suppressed (previous dialog still open)")
-            return
-        if self._cache_is_fresh():
-            fetch_usage._log("prompt: suppressed (cache has fresh valid data)")
-            return
-
-        def verify_and_maybe_spawn():
-            try:
-                res = fetch_usage.fetch_and_save()
-            except Exception as e:
-                fetch_usage._log(
-                    f"prompt: verify raised {type(e).__name__}; not spawning")
-                return
-            if isinstance(res, dict) and res.get("error") in ("expired", "no_session"):
-                fetch_usage._log(
-                    f"prompt: verify confirmed {res['error']}; spawning setup")
-                self.root.after(0, self._spawn_setup_now)
-            else:
-                fetch_usage._log("prompt: verify returned OK; not spawning")
-        threading.Thread(target=verify_and_maybe_spawn, daemon=True).start()
-
-    def _cache_is_fresh(self) -> bool:
-        """True if the usage cache currently has valid percentages and
-        was written recently enough that an `expired` signal is suspect.
-
-        Two windows:
-        * 5 min in steady state — if we haven't heard a fresh 'ok:' in
-          5 min, the scheduler is suspect anyway and the watchdog will
-          respawn us shortly.
-        * 12 h during the first 10 min of *monitor process* uptime —
-          covers two distinct races behind one guard:
-            – cold boot (2026-05-29 incident): Anthropic backend can
-              return real 401 for >6 min while the OS network stack
-              (TLS, DNS, AV, VPN) warms up; PR #5's 60 s retry can't
-              absorb that.
-            – wake from overnight hibernate + watchdog respawn
-              (2026-05-31 incident): Windows uptime is huge but the
-              monitor process is fresh; PR #6's Windows-uptime gate
-              missed this entirely. cloudscraper also takes 2-3 tries
-              to pass Cloudflare's TLS challenge after a long sleep,
-              and the first try can surface as `no_session` /
-              `expired` even though the key is valid.
-          A 12 h window covers a typical overnight pause; if the
-          previous run wrote a successful tick before shutdown
-          (the common case), the key was demonstrably valid earlier
-          today and a transient auth signal right after process start
-          is the network race, not real expiry."""
-        try:
-            cache = json.loads(CACHE_FILE.read_text("utf-8"))
-        except (OSError, ValueError):
-            return False
-        if not isinstance(cache, dict) or "error" in cache or "fh_pct" not in cache:
-            return False
-        try:
-            fetched = datetime.fromisoformat(cache["fetched_at"]).timestamp()
-        except (KeyError, ValueError, TypeError):
-            return False
-        age = time.time() - fetched
-        if age < 300:
-            return True
-        sys_uptime  = _system_uptime_s()
-        proc_uptime = time.time() - self._start_time
-        # Process-uptime trust window: while the monitor process is fresh,
-        # ANY non-error cache is enough — the failure mode we keep hitting
-        # post-reboot/wake is cloudscraper getting 401'd or aborted by
-        # Cloudflare during the first minutes after process start while
-        # the network stack and TLS challenge warm up. Better to display
-        # slightly stale numbers for 10 min than to pop Setup on the user
-        # every reboot. The 2026-06-05 incident (cache age 35 h, beyond
-        # the previous 12 h trust window) confirmed that bounding trust
-        # by cache age while the process is fresh is the wrong axis.
-        if proc_uptime < 600:
-            fetch_usage._log(
-                f"prompt: cache age {int(age)}s trusted during process-uptime "
-                f"window (sys_uptime {int(sys_uptime)}s, proc_uptime {int(proc_uptime)}s)")
-            return True
-        # System-uptime guard kept as a safety net for the very first
-        # post-reboot launch when the monitor process is older than 10 min
-        # but Windows itself was just up (e.g. respawn cascade during boot).
-        if age < 43_200 and sys_uptime < 600:
-            fetch_usage._log(
-                f"prompt: cache age {int(age)}s within system-uptime window "
-                f"(sys_uptime {int(sys_uptime)}s)")
-            return True
-        return False
-
-    def _spawn_setup_now(self):
+            return  # a setup window is already open
         setup_path = Path(__file__).with_name("setup.py")
         if not setup_path.exists():
             return
@@ -1154,19 +1093,16 @@ class JeanClaudeCombien:
         if now   is None: now   = datetime.now(tz=timezone.utc)
         lang  = self.cfg["lang"]
         lines = ["JeanClaudeCombien"]
-        for key_pct, key_rst, icon, name_key, win_s in ROWS:
-            name = i18n.get(lang, name_key)
-            if key_rst is None:
-                used  = cache.get("ex_used",  0)
-                limit = cache.get("ex_limit", 0)
-                curr  = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
-                lines.append(f"{icon} {name}: {used:.2f} / {limit:.2f} {curr}".rstrip())
+        for row in _display_rows(cache, lang):
+            if row["credits"] is not None:
+                lines.append(f"{row['icon']} {row['label']}: "
+                             f"{_credits_text(row['credits'])}".rstrip())
             else:
-                pct = float(cache.get(key_pct, 0))
-                if reset_passed(cache.get(key_rst), now):
+                pct = float(row["pct"] or 0)
+                if row["reset"] and reset_passed(row["reset"], now):
                     pct = 0.0
-                rst = fmt_reset(cache.get(key_rst), lang, win_s, now)
-                lines.append(f"{icon} {name}: {pct:.0f}%   {rst}")
+                rst = fmt_reset(row["reset"], lang, 0, now)
+                lines.append(f"{row['icon']} {row['label']}: {pct:.0f}%   {rst}")
         return _truncate_utf16("\n".join(lines))
 
     def _show_hover_card(self):
@@ -1191,25 +1127,22 @@ class JeanClaudeCombien:
         cache = read_cache()
         lang  = self.cfg["lang"]
         now   = datetime.now(tz=timezone.utc)
-        for key_pct, key_rst, icon, name_key, win_s in ROWS:
-            row = tk.Frame(body, bg=C["bg"])
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=f"{icon} {i18n.get(lang, name_key)}",
+        for row in _display_rows(cache, lang):
+            r = tk.Frame(body, bg=C["bg"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=f"{row['icon']} {row['label']}",
                      bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8),
                      width=12, anchor="w").pack(side="left")
-            if key_rst is None:
-                used  = cache.get("ex_used",  0)
-                limit = cache.get("ex_limit", 0)
-                curr  = "€" if cache.get("ex_curr") == "EUR" else cache.get("ex_curr", "")
-                tk.Label(row, text=f"{used:.2f} / {limit:.2f} {curr}",
+            if row["credits"] is not None:
+                tk.Label(r, text=_credits_text(row["credits"]),
                          bg=C["bg"], fg=C["text"], font=("Segoe UI", 8)).pack(side="left")
             else:
-                pct = float(cache.get(key_pct, 0))
-                if reset_passed(cache.get(key_rst), now):
+                pct = float(row["pct"] or 0)
+                if row["reset"] and reset_passed(row["reset"], now):
                     pct = 0.0
-                tk.Label(row, text=f"{pct:.0f}%", bg=C["bg"], fg=pct_color(pct),
+                tk.Label(r, text=f"{pct:.0f}%", bg=C["bg"], fg=pct_color(pct),
                          font=("Segoe UI", 8, "bold"), width=5, anchor="e").pack(side="left")
-                tk.Label(row, text=fmt_reset(cache.get(key_rst), lang, win_s, now),
+                tk.Label(r, text=fmt_reset(row["reset"], lang, 0, now),
                          bg=C["bg"], fg=C["muted"], font=("Segoe UI", 8)
                          ).pack(side="left", padx=(6, 0))
 

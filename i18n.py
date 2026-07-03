@@ -16,8 +16,6 @@ STRINGS = {
     "en": {
         "row_5h":              "5h window",
         "row_week":            "Week",
-        "row_sonnet":          "Sonnet",
-        "row_design":          "Design",
         "row_credits":         "Credits",
         "reset_done":          "↺ reset",
         "menu_compact":        "→ Compact mode",
@@ -37,8 +35,6 @@ STRINGS = {
     "fr": {
         "row_5h":              "Fenêtre 5h",
         "row_week":            "Semaine",
-        "row_sonnet":          "Sonnet",
-        "row_design":          "Design",
         "row_credits":         "Crédits",
         "reset_done":          "↺ réinit.",
         "menu_compact":        "→ Mode compact",
@@ -58,8 +54,6 @@ STRINGS = {
     "es": {
         "row_5h":              "Ventana 5h",
         "row_week":            "Semana",
-        "row_sonnet":          "Sonnet",
-        "row_design":          "Diseño",
         "row_credits":         "Créditos",
         "reset_done":          "↺ reinic.",
         "menu_compact":        "→ Modo compacto",
@@ -79,8 +73,6 @@ STRINGS = {
     "ru": {
         "row_5h":              "5ч окно",
         "row_week":            "Неделя",
-        "row_sonnet":          "Sonnet",
-        "row_design":          "Дизайн",
         "row_credits":         "Кредиты",
         "reset_done":          "↺ сброс",
         "menu_compact":        "→ Компактный",
@@ -101,8 +93,6 @@ STRINGS = {
         # Luganda — spoken in Uganda
         "row_5h":              "Saawa 5",
         "row_week":            "Sabbiiti",
-        "row_sonnet":          "Sonnet",
-        "row_design":          "Design",
         "row_credits":         "Ensimbi",
         "reset_done":          "↺ okuddamu",
         "menu_compact":        "→ Entono",
