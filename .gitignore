@@ -29,3 +29,5 @@ Thumbs.db
 # Local-only artifacts
 *.lnk.disabled
 monitor_guard.log
+_probe_*.py
+_probe_*.json

@@ -117,6 +117,13 @@ WATCHDOG_FATAL_S = 600
 # this long, the process is a silent-fetch zombie (incident 2026-06-22) and
 # the watchdog respawns it even though its heartbeat looks healthy.
 CACHE_STALE_S = 360
+# Self-heal backstop: respawn after this many consecutive failed fetches.
+# Deliberately based only on an in-memory counter — no file reads, no logging
+# — because the failure mode it targets (incident 2026-07-18) is precisely a
+# process that can neither log nor stat its own files, which blinds both
+# _log and the watchdog's cache-staleness branch. At the 30 s retry cadence
+# used after a failure this fires in ~2.5 min.
+SELF_HEAL_FAILS = 5
 
 
 try:
@@ -886,6 +893,19 @@ class JeanClaudeCombien:
                 fetch_usage._log(
                     f"fetch {status}; fail_streak={fail_streak} — heartbeat held, "
                     f"watchdog respawns after {WATCHDOG_FATAL_S}s of failures")
+                # SELF-HEAL (incident 2026-07-18): the process kept showing
+                # "⚠ session" for a whole day while writing NOTHING to any of
+                # _log's three tiers — it had lost access to %APPDATA%\Claude,
+                # so SESSION.exists() read False (-> no_session) and every log
+                # write failed silently. The watchdog could not rescue it
+                # either: its cache-staleness branch needs CACHE_FILE.stat(),
+                # which fails in exactly that state, leaving cache_stale=None.
+                # So bail out on the fail count alone — it needs no file I/O
+                # and no logging to work. A fresh process fetches cleanly
+                # (proven every time the user relaunches via the shortcut).
+                if fail_streak >= SELF_HEAL_FAILS:
+                    self._respawn_and_exit(
+                        f"self-heal: {fail_streak} consecutive failures")
             # ok → full 3-min cadence; transient failure → retry in 30 s so a
             # cold-network miss right after wake recovers fast instead of
             # sitting on a stale cache for three minutes.
@@ -980,23 +1000,44 @@ class JeanClaudeCombien:
                     reason = (f"cache stale {cache_stale:.0f}s >{CACHE_STALE_S}s "
                               f"(silent-fetch zombie)")
                 if reason:
-                    try:
-                        fetch_usage._log(
-                            f"watchdog: {reason}; respawning self and exiting")
-                    except Exception:
-                        pass
-                    try:
-                        subprocess.Popen(
-                            [sys.executable, __file__],
-                            cwd=str(Path(__file__).parent),
-                        )
-                    except Exception:
-                        pass
-                    os._exit(2)
+                    self._respawn_and_exit(f"watchdog: {reason}")
             except Exception:
                 # Never crash the watchdog on a transient OS hiccup —
                 # the next loop iteration retries cleanly.
                 pass
+
+    def _respawn_and_exit(self, reason: str):
+        """Replace this process, but exit ONLY after the replacement is
+        confirmed running.
+
+        The old respawn (both here and in self-heal) did
+        `try: Popen except: pass` followed by an UNCONDITIONAL os._exit —
+        so if the spawn failed (which happens mid-standby, incidents
+        2026-07-12/20), the process killed itself and left nothing behind:
+        the overlay 'vanished with no error'. Now a failed or still-born
+        spawn means we STAY ALIVE and keep showing the last good data
+        rather than orphaning the user."""
+        try:
+            fetch_usage._log(f"respawn: {reason}")
+        except Exception:
+            pass
+        try:
+            child = subprocess.Popen([sys.executable, __file__],
+                                     cwd=str(Path(__file__).parent))
+        except Exception as e:
+            try:
+                fetch_usage._log(f"respawn: Popen failed ({type(e).__name__}); staying alive")
+            except Exception:
+                pass
+            return
+        time.sleep(1.5)
+        if child.poll() is not None:            # replacement died immediately
+            try:
+                fetch_usage._log(f"respawn: replacement exited rc={child.returncode}; staying alive")
+            except Exception:
+                pass
+            return
+        os._exit(2)                             # replacement confirmed — hand off
 
     # ── Tray mode ─────────────────────────────────────────────────────────────
     def _enter_tray_if_pending(self):
